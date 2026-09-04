@@ -1,0 +1,13 @@
+# Provisioned from the committed JSON, never hand-clicked (WORKLOAD §2): a dashboard that only
+# exists in Grafana's database is a dashboard that dies with the ops box.
+apiVersion: 1
+providers:
+  - name: rtdb
+    folder: RTDB
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      # NOT under /var/lib/grafana: that path is the data volume, which would mask it.
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

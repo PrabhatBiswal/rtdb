@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: rtdb-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # The floor for $__interval. Without it a narrow time range makes Grafana ask for a step
+      # SMALLER than the 15s scrape, and `max_over_time(x[$__interval])` then covers windows with no
+      # sample in them at all — gaps in the very panels added to stop peaks being missed.
+      timeInterval: 15s

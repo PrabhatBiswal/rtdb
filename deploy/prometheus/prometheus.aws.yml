@@ -1,0 +1,34 @@
+# The ops box's config (Gate A ruling Q4). Targets are DISCOVERED, not listed: an instance that is
+# replaced, or a third gateway added later, needs no rebuild and no edit here.
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    shard: "0"
+
+scrape_configs:
+  - job_name: rtdb-gateway
+    metrics_path: /metrics
+    ec2_sd_configs:
+      - region: ap-south-1
+        port: 9090
+    relabel_configs:
+      # Ours only. Everything else in this account belongs to another project (§0.7).
+      - source_labels: [__meta_ec2_tag_Project]
+        regex: rtdb
+        action: keep
+      - source_labels: [__meta_ec2_tag_Role]
+        regex: gateway
+        action: keep
+      - source_labels: [__meta_ec2_instance_state]
+        regex: running
+        action: keep
+      # `instance` becomes the Name tag, so a panel legend says rtdb-gw-1, not an IP that changes.
+      - source_labels: [__meta_ec2_tag_Name]
+        target_label: instance
+      - source_labels: [__meta_ec2_availability_zone]
+        target_label: az
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

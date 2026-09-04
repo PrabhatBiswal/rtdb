@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:name=".DemoApp"
+        android:label="RTDB Demo"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.RtdbDemo"
+        android:usesCleartextTraffic="true">
+        <!-- adjustResize, not the default pan. The root's middle section is weighted, so resizing
+             lets the read card shrink to make room for the keyboard; panning instead slides the
+             whole layout up and takes the write card's result line — the last element, and the one
+             that says what §4 did with the write — with it. It sits at y≈2298 on a 2400px screen,
+             which is behind any keyboard. -->
+        <activity
+            android:windowSoftInputMode="adjustResize"
+            android:name=".DemoActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

@@ -1,0 +1,110 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  postgres:
+    runs-on: ubuntu-latest
+    # The memory job above is untouched and stays the gate for `npm test`; this one is the same
+    # repo against a real PostgreSQL 16 (WP4). Tests create and drop their own databases.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The BINARY, not a service container: the chaos suites SIGKILL Redis, and a service container
+      # cannot be killed by the tests that need it dead (WORKLOAD §0.8 / §2). Tests spawn their own
+      # instances on ephemeral ports and kill only what they spawned.
+      - run: sudo apt-get update && sudo apt-get install -y redis-server
+      - run: npm run test:pg
+        env:
+          RTDB_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      # §8's bus on a real Redis: leader election, the publisher, the stream's ordering contract,
+      # and the whole integration suite delivered over it.
+      - run: npm run test:bus
+        env:
+          RTDB_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      # The same eleven scenarios again with TWO gateways on one shard and one Redis, plus the three
+      # deaths that only exist once there are two: the leader, the follower, and the bus.
+      - run: npm run chaos:cluster
+        env:
+          RTDB_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      # The durability half: the same eleven scenarios with the gateway SIGKILLed under load, on a
+      # real database. Both hangs found at Gate D showed up here first and only here (WP4 Gate D
+      # ruling Q3) — a suite that has hung before is exactly the one CI should be running.
+      - run: npm run chaos:pg
+        env:
+          RTDB_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
+  # WORKLOAD §6 Gate A: CI builds the image. A built image that has never been started is not a
+  # tested image, so this job also boots it, scrapes it, and stops it with SIGTERM.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t rtdb-gateway:ci .
+      - name: boot, probe, scrape
+        run: |
+          docker run -d --name gw -e RTDB_ADMIN_PORT=9090 -p 9090:9090 rtdb-gateway:ci
+          for _ in $(seq 30); do curl -fsS http://127.0.0.1:9090/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:9090/healthz | grep -qx ok
+          curl -fsS http://127.0.0.1:9090/metrics | grep -q '^rtdb_connections'
+      # The SIGTERM tooth: `docker stop` sends SIGTERM and SIGKILLs after the timeout. Exit code 0
+      # means the gateway shut itself down; 137 would mean it ignored the signal and was killed.
+      - name: SIGTERM drains
+        run: |
+          docker stop -t 20 gw
+          test "$(docker inspect -f '{{.State.ExitCode}}' gw)" = 0
+
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The SDK's integration tests spawn the real Node gateway (WORKLOAD §5) — no mock servers.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: ./gradlew check
+        working-directory: sdk-kotlin
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      # No emulator: Robolectric (WORKLOAD §3) runs the lifecycle/connectivity tests on the JVM.
+      # The runner's preinstalled Android SDK is found via ANDROID_HOME; sdk-android/local.properties
+      # is a local-only file and is not checked in.
+      - run: ./gradlew check
+        working-directory: sdk-android

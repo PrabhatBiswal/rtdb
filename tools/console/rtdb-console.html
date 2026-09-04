@@ -1,0 +1,1706 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RTDB console</title>
+<!--
+  A live view of an RTDB shard. One file, no server, no build step, no dependency: browser-native
+  WebSocket speaking PROTOCOL.md v1.5 directly.
+
+  READ-ONLY. No write frame is constructed anywhere in this file — see `send()`'s allowlist.
+  The token is pasted at runtime and never stored, never embedded, never put in the URL.
+  Mint one with: node --import tsx scripts/console-token.ts --name <you>
+
+  Metrics live in Grafana, not here.
+-->
+<style>
+  /* LIGHT is the default. Same layered-surface discipline as the dark build — depth from stacked
+     near-whites rather than one flat sheet, which is what stops a light UI reading as a form.
+     Every colour below is a variable precisely so the theme is a palette swap and nothing else. */
+  :root {
+    --bg:#eef1f6; --surface:#ffffff; --surface-2:#f7f9fc; --raised:#ffffff;
+    --line:#dde3ec; --line-2:#c3ccda; --line-soft:#e8edf4;
+    --sunken:#f4f7fb; --sunken-2:#edf1f7; --hover:#f2f6fc; --raised-2:#f2f5fa;
+    --fg:#111823; --fg-2:#3d4757; --dim:#68737f; --dimmer:#98a2b0;
+    --ok:#0f8a52; --warn:#9a6300; --bad:#c92a2a; --accent:#2563eb;
+    /* Scalar hues re-picked for contrast on white, not the dark pastels dimmed down. */
+    --s-str:#0a7343; --s-num:#0b53c0; --s-bool:#6b28c4; --s-null:#8892a2;
+    --scroll:#c5cedb; --glow:#dbe6fb; --inset-hi:#00000008;
+    --shadow:0 1px 2px #0f172a0f, 0 8px 24px -12px #0f172a2e;
+    --shadow-lg:0 24px 64px -20px #0f172a33;
+    --btn-fg:#fff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --ui:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+    --r:8px; --r-sm:6px;
+    color-scheme:light;
+  }
+  /* The original dark build, unchanged in intent — now opt-in behind the header toggle. */
+  :root[data-theme=dark] {
+    --bg:#0b0e14; --surface:#111621; --surface-2:#151b28; --raised:#1a2130;
+    --line:#212a3a; --line-2:#2f3c53; --line-soft:#1a2230;
+    --sunken:#080b11; --sunken-2:#0d1220; --hover:#161e2c; --raised-2:#212a3c;
+    --fg:#e3e9f2; --fg-2:#aab6c8; --dim:#7484a0; --dimmer:#4b5871;
+    --ok:#3fd77f; --warn:#f0b429; --bad:#ff6b6b; --accent:#5b9dff;
+    --s-str:#7ee7a8; --s-num:#79b8ff; --s-bool:#c9a2ff; --s-null:#6b7a95;
+    --scroll:#263144; --glow:#16213a; --inset-hi:#ffffff0a;
+    --shadow:0 1px 2px #0006, 0 8px 24px -12px #0009;
+    --shadow-lg:0 24px 64px -20px #000c;
+    --btn-fg:#fff;
+    color-scheme:dark;
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+  /* The PAGE never changes height: header, bars and footer are fixed rows and the tree is the one
+     flexible row that scrolls inside itself. Before this, a subtree arriving or leaving grew the
+     document and the footer bounced with it. */
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.6 var(--ui);
+         font-feature-settings:"cv05","ss01";
+         display:flex; flex-direction:column; height:100dvh; overflow:hidden; }
+  ::selection { background:color-mix(in srgb, var(--accent) 24%, transparent); }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:transparent; border:3px solid transparent;
+                              background-clip:padding-box; border-radius:99px; }
+  :hover::-webkit-scrollbar-thumb { background:var(--scroll); background-clip:padding-box; }
+
+  /* ------------------------------------------------------------------ header */
+  header { position:sticky; top:0; z-index:5; background:linear-gradient(180deg,var(--surface),var(--surface-2));
+           border-bottom:1px solid var(--line); padding:12px 18px;
+           display:flex; gap:14px; align-items:center; flex-wrap:wrap; box-shadow:var(--shadow); }
+  header::before { content:''; position:absolute; inset:0 0 auto 0; height:1px;
+                   background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--accent) 30%,transparent) 30%,color-mix(in srgb,var(--accent) 30%,transparent) 70%,transparent); }
+  .brand { display:flex; align-items:baseline; gap:9px; margin-right:2px; }
+  .brand b { font-size:14.5px; font-weight:640; letter-spacing:-.01em; }
+  .tag { font-size:10.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
+         color:var(--dim); border:1px solid var(--line); border-radius:999px; padding:2px 8px; }
+  .group { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+  #theme { margin-left:-4px; font-variant:small-caps; letter-spacing:.04em; }
+
+  input { font:13px/1.4 var(--mono); padding:7px 11px; color:var(--fg); background:var(--sunken);
+          border:1px solid var(--line); border-radius:var(--r-sm); outline:none;
+          transition:border-color .15s, box-shadow .15s, background .15s; }
+  input:hover { border-color:var(--line-2); }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent); background:var(--surface); }
+  input::placeholder { color:var(--dimmer); }
+  input[name=url]{width:23ch} input[name=token]{width:19ch} #filter{width:17ch}
+
+  button { font:13px/1.4 var(--ui); font-weight:520; padding:7px 13px; color:var(--fg-2);
+           background:var(--raised); border:1px solid var(--line); border-radius:var(--r-sm);
+           cursor:pointer; transition:background .15s, border-color .15s, color .15s, transform .06s; }
+  button:hover:not(:disabled) { background:var(--raised-2); border-color:var(--line-2); color:var(--fg); }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:disabled { opacity:.38; cursor:default; }
+  button.primary { background:linear-gradient(180deg,#3b82f6,#2563eb); border-color:#2f6ef0; color:var(--btn-fg);
+                   box-shadow:0 1px 0 #ffffff33 inset, 0 2px 8px -2px #2563eb66; }
+  button.primary:hover { background:linear-gradient(180deg,#4a8cf8,#2f6ef0); }
+  .link { background:none; border:none; color:var(--dim); padding:3px 6px; font-size:12px; font-weight:500; }
+  .link:hover { color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+
+  /* ------------------------------------------------------------------ status bar */
+  #bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+         padding:9px 18px; background:var(--surface); border-bottom:1px solid var(--line-soft); }
+  .pill { display:inline-flex; align-items:center; gap:7px; padding:3px 12px 3px 9px; border-radius:999px;
+          font-size:12px; font-weight:600; letter-spacing:.01em; border:1px solid transparent; }
+  .pill i { width:7px; height:7px; border-radius:50%; background:currentColor; flex:none;
+            box-shadow:0 0 0 3px currentColor; opacity:1; }
+  .pill.ok   { color:var(--ok);   background:color-mix(in srgb,var(--ok) 12%,var(--surface));   border-color:color-mix(in srgb,var(--ok) 34%,var(--surface)); }
+  .pill.ok i { box-shadow:0 0 8px 1px color-mix(in srgb,var(--ok) 70%,transparent); }
+  .pill.warn { color:var(--warn); background:color-mix(in srgb,var(--warn) 12%,var(--surface)); border-color:color-mix(in srgb,var(--warn) 34%,var(--surface)); }
+  .pill.warn i { animation:pulse 1.4s ease-in-out infinite; }
+  .pill.bad  { color:var(--bad);  background:color-mix(in srgb,var(--bad) 12%,var(--surface));  border-color:color-mix(in srgb,var(--bad) 34%,var(--surface)); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .chip { font:12px var(--mono); font-variant-numeric:tabular-nums; color:var(--dim);
+          background:var(--sunken); border:1px solid var(--line-soft); border-radius:var(--r-sm); padding:3px 10px; }
+  .chip b { color:var(--fg-2); font-weight:600; }
+  .grow { flex:1; }
+  #s-err { color:var(--bad); font-size:12.5px; font-weight:500; }
+
+  /* ------------------------------------------------------------------ stats strip */
+  #stats { display:flex; gap:18px; align-items:baseline; flex-wrap:wrap;
+           padding:7px 18px; background:var(--surface-2); border-bottom:1px solid var(--line-soft);
+           font-size:12px; color:var(--dim); }
+  #stats[hidden] { display:none; }
+  .stat { display:inline-flex; align-items:baseline; gap:6px; }
+  .stat b { font:13px var(--mono); font-variant-numeric:tabular-nums; color:var(--fg); font-weight:600; }
+  .stat i { font-style:normal; color:var(--dim); }
+  .stat.gws { gap:14px; }
+  .stat.gws span { display:inline-flex; align-items:baseline; gap:5px; }
+  .stat.gws i { font-style:normal; color:var(--dimmer); font:11.5px var(--mono); }
+  .stat.gws b { font:12.5px var(--mono); font-variant-numeric:tabular-nums;
+                color:var(--fg-2); font-weight:600; }
+  .stat-age { font:11px var(--ui); color:var(--dimmer); }
+  .stat-age.stale { color:var(--warn); }
+
+  /* ------------------------------------------------------------------ path bar */
+  /* The answer to "which node am I looking at". It is the source of truth for the watched root:
+     it always reads the real path, and editing it navigates. */
+  #pathbar { display:flex; align-items:center; gap:8px; padding:8px 18px;
+             background:var(--surface); border-bottom:1px solid var(--line-soft); }
+  #pathbar[hidden] { display:none; }
+  .pb-label { font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+              color:var(--dimmer); flex:none; }
+  #crumbs { display:flex; align-items:center; flex-wrap:wrap; gap:2px; font:13px var(--mono);
+            cursor:text; flex:1; min-width:0; padding:3px 8px; border:1px solid transparent;
+            border-radius:var(--r-sm); }
+  /* An ID selector setting display beats the UA's [hidden] rule, so hiding it needs saying here.
+     Without this the breadcrumb and the editor render on top of each other. */
+  #crumbs[hidden] { display:none; }
+  #crumbs:hover { border-color:var(--line); background:var(--sunken); }
+  #crumbs .seg { color:var(--accent); padding:1px 5px; border-radius:4px; cursor:pointer; }
+  #crumbs .seg:hover { background:color-mix(in srgb,var(--accent) 12%,transparent); }
+  #crumbs .seg.last { color:var(--fg); font-weight:600; cursor:default; }
+  #crumbs .seg.last:hover { background:none; }
+  #crumbs .sep { color:var(--dimmer); }
+  #crumbs .hint { color:var(--dimmer); }
+  #path-edit { flex:1; min-width:0; font:13px var(--mono); }
+  #path-edit[hidden] { display:none; }
+
+  /* ------------------------------------------------------- root namespaces (§5.6)
+     The console can never listen on root — TOOBIG is the designed answer (§3) — so top-level names
+     were undiscoverable and an operator had to be TOLD that `userstatus` existed. This lists them,
+     fetched out of band of the wire from the gateway's admin port. */
+  #workspace { display:flex; flex:1 1 auto; min-height:0; }
+  #roots { flex:none; width:186px; border-right:1px solid var(--line-soft); overflow-y:auto;
+           padding:14px 0 20px; display:flex; flex-direction:column; gap:1px; }
+  #roots[hidden] { display:none; }
+  .roots-head { display:flex; align-items:center; gap:6px; padding:0 12px 8px;
+                color:var(--dimmer); font-size:10.5px; letter-spacing:.13em; text-transform:uppercase; }
+  .roots-head .grow { flex:1; }
+  #roots-refresh { background:none; border:0; color:var(--dimmer); cursor:pointer; font-size:12px;
+                   padding:0 2px; line-height:1; }
+  #roots-refresh:hover { color:var(--fg); }
+  .root { display:block; width:100%; text-align:left; background:none; border:0; cursor:pointer;
+          font-family:var(--mono); font-size:12.5px; color:var(--fg);
+          padding:5px 12px; border-left:2px solid transparent; }
+  .root:hover { background:var(--surface-2); }
+  .root[aria-current="true"] { border-left-color:var(--accent); color:var(--accent);
+                               background:var(--surface-2); }
+  .roots-note { padding:6px 12px; color:var(--dimmer); font-size:11.5px; line-height:1.5; }
+
+  /* ------------------------------------------------------------------ tree */
+  #tree { padding:14px 18px 20px; font-family:var(--mono); font-size:13px;
+          display:flex; flex-direction:column;
+          flex:1 1 auto; overflow-y:auto; overflow-x:auto; min-height:0; }
+  header, #bar, #stats, #pathbar, footer { flex:none; }
+  .node { position:relative; padding-left:17px; }
+  .node::before { content:''; position:absolute; left:6px; top:2px; bottom:2px; width:1px;
+                  background:linear-gradient(180deg,var(--line),transparent); }
+  .row { display:flex; gap:8px; align-items:baseline; padding:3px 8px; margin-left:-8px;
+         border-radius:var(--r-sm); cursor:pointer; transition:background .12s, opacity .18s; }
+  .row:hover { background:var(--hover); }
+  .row.dim { opacity:.22; }
+  .tw { width:1.1ch; color:var(--dimmer); flex:none; transition:transform .16s cubic-bezier(.4,0,.2,1), color .12s; }
+  .row:hover .tw { color:var(--dim); }
+  .tw.open { transform:rotate(90deg); color:var(--accent); }
+  .tw.leaf { visibility:hidden; }
+  .key { color:var(--fg-2); letter-spacing:-.01em; }
+  .key.branch { color:var(--fg); font-weight:600; }
+  /* A name you can go into looks like one. The chevron beside it still only opens in place. */
+  .key.drill { cursor:pointer; }
+  .key.drill:hover { color:var(--accent); text-decoration:underline; text-underline-offset:2px; }
+  .count { color:var(--dimmer); font-size:11px; font-variant-numeric:tabular-nums;
+           background:var(--sunken-2); border:1px solid var(--line-soft); border-radius:999px; padding:0 7px; }
+  /* A collapsed branch has no count yet; an empty badge renders as a stray dash. */
+  .count:empty { display:none; }
+  .val { word-break:break-all; font-variant-numeric:tabular-nums; }
+  .t-string{color:var(--s-str)} .t-number{color:var(--s-num)}
+  .t-boolean{color:var(--s-bool)} .t-null{color:var(--s-null);font-style:italic}
+  .tools { margin-left:auto; display:flex; gap:1px; opacity:0; flex:none; transition:opacity .15s; }
+  .row:hover .tools, .row:focus-within .tools { opacity:1; }
+  .json { margin:4px 0 10px 17px; padding:12px 14px; background:var(--sunken); color:var(--fg-2);
+          border:1px solid var(--line-soft); border-left:2px solid var(--accent);
+          border-radius:var(--r); font-size:12px; line-height:1.65; white-space:pre; overflow-x:auto;
+          box-shadow:var(--shadow); }
+  .json-cap { display:block; font:10.5px var(--ui); font-weight:600; letter-spacing:.08em;
+              text-transform:uppercase; color:var(--dimmer); margin-bottom:8px; }
+  .err { margin:4px 0 8px 17px; padding:9px 13px; border-radius:var(--r); font:12.5px var(--ui);
+         color:var(--bad); background:color-mix(in srgb,var(--bad) 9%,var(--surface)); border:1px solid color-mix(in srgb,var(--bad) 28%,var(--surface)); }
+  .err small { display:block; color:var(--dim); margin-top:4px; font-size:12px; }
+  @keyframes fade { from{background:color-mix(in srgb,var(--accent) 26%,transparent)} to{background:transparent} }
+  .flash { animation:fade 1.5s cubic-bezier(.2,0,.2,1); border-radius:4px; }
+
+  /* ------------------------------------------------------------------ login */
+  #login { position:fixed; inset:0; z-index:20; display:grid; place-items:center;
+           background:radial-gradient(1200px 600px at 50% -10%,var(--glow),var(--bg) 60%); }
+  #login[hidden] { display:none; }
+  #login-card { width:min(92vw,368px); background:linear-gradient(180deg,var(--surface),var(--surface-2));
+                border:1px solid var(--line); border-radius:14px; padding:30px 28px 24px;
+                box-shadow:var(--shadow-lg), 0 1px 0 var(--inset-hi) inset;
+                display:flex; flex-direction:column; gap:13px; }
+  .lc-brand { font-size:17px; font-weight:640; letter-spacing:-.015em; }
+  .lc-sub { margin:-8px 0 6px; color:var(--dim); font-size:13px; }
+  #login-card label { display:flex; flex-direction:column; gap:6px; font-size:12px;
+                      font-weight:600; color:var(--dim); letter-spacing:.02em; }
+  #login-card input { width:100%; font-family:var(--ui); font-size:14px; padding:9px 12px; }
+  #login-card button { margin-top:5px; padding:10px; font-size:14px; font-weight:600; }
+  .lc-err { color:var(--bad); font-size:12.5px; min-height:1.2em; }
+  .lc-foot { margin:2px 0 0; color:var(--dimmer); font-size:11.5px; line-height:1.5; }
+
+  /* ------------------------------------------------------------------ users (owner only) */
+  #edit { position:fixed; inset:0; z-index:19; display:grid; place-items:center; padding:24px;
+          background:color-mix(in srgb,var(--bg) 74%,transparent); backdrop-filter:blur(7px); }
+  #edit[hidden] { display:none; }
+  #edit-card { width:min(94vw,560px); background:linear-gradient(180deg,var(--surface),var(--surface-2));
+               border:1px solid var(--line); border-radius:14px; padding:22px;
+               box-shadow:var(--shadow-lg), 0 1px 0 var(--inset-hi) inset;
+               display:flex; flex-direction:column; gap:12px; }
+  .ed-path { font:12.5px var(--mono); color:var(--fg-2); background:var(--sunken); padding:8px 11px;
+             border:1px solid var(--line-soft); border-radius:var(--r-sm); word-break:break-all; }
+  #edit-card label { display:flex; flex-direction:column; gap:6px; font-size:12px; font-weight:600;
+                     color:var(--dim); letter-spacing:.02em; }
+  #ed-value { font:13px/1.5 var(--mono); padding:9px 11px; color:var(--fg); background:var(--sunken);
+              border:1px solid var(--line); border-radius:var(--r-sm); min-height:74px; resize:vertical; }
+  #ed-value:focus { border-color:var(--accent); outline:none; }
+  .ed-row { display:flex; gap:8px; align-items:center; }
+  .ed-msg { font-size:12.5px; min-height:1.2em; }
+  .ed-msg.bad { color:var(--bad); }
+  .ed-msg.ok { color:var(--ok); }
+  .row .tools .danger { color:var(--bad); }
+
+  #users { position:fixed; inset:0; z-index:19; display:grid; place-items:center; padding:24px;
+           background:color-mix(in srgb,var(--bg) 74%,transparent); backdrop-filter:blur(7px); }
+  #users[hidden] { display:none; }
+  #users-card { width:min(94vw,540px); max-height:86dvh; overflow:auto;
+                background:linear-gradient(180deg,var(--surface),var(--surface-2));
+                border:1px solid var(--line); border-radius:14px; padding:24px 24px 20px;
+                box-shadow:var(--shadow-lg), 0 1px 0 var(--inset-hi) inset;
+                display:flex; flex-direction:column; gap:14px; }
+  .uc-head { display:flex; align-items:baseline; gap:10px; }
+  .uc-head b { font-size:16px; font-weight:640; letter-spacing:-.015em; }
+  .uc-head span { color:var(--dim); font-size:12.5px; }
+  .uc-row { display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid var(--line-soft); }
+  .uc-row .who { flex:1; min-width:0; font:13px var(--mono); overflow:hidden; text-overflow:ellipsis;
+                 white-space:nowrap; color:var(--fg-2); }
+  .uc-row .you { color:var(--dimmer); font-size:11.5px; font-family:var(--ui); }
+  select { font:13px/1.4 var(--ui); padding:6px 9px; color:var(--fg); background:var(--sunken);
+           border:1px solid var(--line); border-radius:var(--r-sm); }
+  select:focus { border-color:var(--accent); outline:none; }
+  /* Two rows: address + role, then the password the owner chooses and its reveal. A grid, because
+     the second row's controls must line up under the first's rather than wrap wherever they land. */
+  .uc-add { display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center;
+            padding-top:12px; border-top:1px dashed var(--line); }
+  .uc-add input { min-width:0; font-family:var(--ui); }
+  #uc-role { grid-column:2 / span 2; }
+  #uc-pass, .uc-reset input { font:13px var(--mono); }
+  /* The reset form opens UNDER the row it belongs to: the owner must see whose password they type. */
+  .uc-reset { display:grid; grid-template-columns:1fr auto auto auto; gap:8px; align-items:center;
+              padding:0 0 9px; }
+  /* Shown once, then gone: the owner hands it over out of band. Selectable, wrapping, unmissable. */
+  .uc-pw { background:var(--sunken-2); border:1px solid var(--line); border-radius:var(--r);
+           padding:11px 13px; font-size:12.5px; color:var(--fg-2); line-height:1.7; }
+  .uc-pw code { display:block; margin-top:4px; font:14px var(--mono); color:var(--fg);
+                word-break:break-all; user-select:all; }
+
+  /* A quiet line at the FOOT of the tree area, not a centrepiece in the middle of the canvas.
+     margin-top:auto is what pushes it down; #tree is a column flexbox for that one reason. */
+  .empty { margin-top:auto; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+           color:var(--dimmer); font:12.5px/1.6 var(--ui); padding:10px 0 0;
+           border-top:1px dashed var(--line-soft); }
+  .empty b { color:var(--dim); font-weight:600; font-size:12.5px; }
+  footer { color:var(--dim); font-size:12.5px; padding:14px 18px; border-top:1px solid var(--line-soft);
+           background:var(--surface); line-height:1.75; }
+  footer code { font:12px var(--mono); color:var(--fg-2); background:var(--sunken);
+                border:1px solid var(--line-soft); border-radius:5px; padding:2px 6px; }
+</style>
+
+<div id="login" hidden>
+  <form id="login-card" autocomplete="on">
+    <div class="lc-brand">RTDB console</div>
+    <p class="lc-sub">Sign in to browse the shard. Read-only.</p>
+    <label>Email<input name="email" type="email" autocomplete="username" required spellcheck="false"></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit" class="primary" id="login-go">Sign in</button>
+    <div id="login-err" class="lc-err"></div>
+    <p class="lc-foot">Sessions last one hour. Access is revocable per user (§10).</p>
+  </form>
+</div>
+
+<div id="users" hidden>
+  <div id="users-card" role="dialog" aria-modal="true" aria-label="console users">
+    <div class="uc-head"><b>Users</b><span class="grow"></span><span id="uc-note"></span></div>
+    <div id="uc-list"></div>
+    <div class="uc-add">
+      <input id="uc-email" type="email" placeholder="name@example.com" spellcheck="false" aria-label="new user email">
+      <select id="uc-role" aria-label="role for the new user">
+        <option value="viewer">viewer</option>
+        <option value="editor">editor</option>
+        <option value="owner">owner</option>
+      </select>
+      <input id="uc-pass" type="password" placeholder="password (8+ characters)" spellcheck="false"
+             autocomplete="new-password" aria-label="password for the new user">
+      <button id="uc-show" type="button" aria-pressed="false">show</button>
+      <button id="uc-add" class="primary" type="button">Add</button>
+    </div>
+    <div id="uc-pw" class="uc-pw" hidden></div>
+    <div id="uc-err" class="lc-err"></div>
+    <p class="lc-foot">A viewer reads. An editor and an owner can also set, add and delete nodes —
+      enforced by the GATEWAY on the token's role, not by this page. Passwords are stored hashed and
+      can never be shown again — a forgotten one is <b>reset</b>, not looked up. Removing a user, or
+      resetting their password, does not end a session already open — that is <code>kick.ts</code>
+      (§10).</p>
+    <button id="uc-close" type="button">Close</button>
+  </div>
+</div>
+
+<div id="edit" hidden>
+  <div id="edit-card" role="dialog" aria-modal="true" aria-labelledby="ed-title">
+    <div class="uc-head"><b id="ed-title">Set value</b></div>
+    <div class="ed-path" id="ed-path"></div>
+    <label id="ed-key-row" hidden>Key<input id="ed-key" spellcheck="false" placeholder="childName"></label>
+    <label>Type
+      <select id="ed-type">
+        <option value="string">string</option>
+        <option value="number">number</option>
+        <option value="boolean">boolean</option>
+        <option value="json">JSON</option>
+        <option value="null">null (deletes)</option>
+      </select>
+    </label>
+    <label>Value<textarea id="ed-value" spellcheck="false"></textarea></label>
+    <div class="ed-msg" id="ed-msg"></div>
+    <div class="ed-row"><button id="ed-save" class="primary" type="button">Save</button>
+      <button id="ed-cancel" type="button">Cancel</button></div>
+  </div>
+</div>
+
+<header>
+  <span class="brand"><b>RTDB console</b><span class="tag" id="mode-tag">read-only</span></span>
+  <button id="theme" class="link" aria-label="switch theme" title="switch theme">dark</button>
+  <button id="users-btn" class="link" type="button" hidden>users</button>
+  <span class="group" id="connect-form">
+    <input name="url" value="ws://127.0.0.1:8080" spellcheck="false" aria-label="endpoint">
+    <input name="token" type="password" placeholder="paste token" spellcheck="false" aria-label="token">
+    <!-- Removed from the DOM entirely when served (see SERVED below); it survives only as the
+         file:// fallback, where pasting a token is the only way in. -->
+    <button id="go" class="primary">Connect</button>
+  </span>
+  <span class="group" id="connected-form" style="display:none">
+    <span class="chip" id="c-url"></span>
+    <button id="disconnect" class="link">change</button>
+    <input id="filter" placeholder="filter loaded" spellcheck="false" aria-label="filter loaded nodes">
+  </span>
+</header>
+
+<div id="bar">
+  <span class="pill warn" id="s-state"><i></i><span id="s-state-t">idle</span></span>
+  <span class="chip">epoch <b id="s-epoch">–</b></span>
+  <span class="chip">lastRev <b id="s-rev">–</b></span>
+  <span class="chip">subs <b id="s-subs">0</b></span>
+  <span class="grow"></span>
+  <span id="s-err"></span>
+</div>
+
+<div id="pathbar" hidden>
+  <span class="pb-label">path</span>
+  <span id="crumbs" title="click a segment to go up; click the bar to type a path"></span>
+  <input id="path-edit" name="path" placeholder="demo/room" spellcheck="false"
+         aria-label="path to watch" hidden>
+  <button id="add">Watch</button>
+</div>
+
+<div id="stats" hidden>
+  <span class="stat"><b id="st-conns">–</b><i>connections</i></span>
+  <span class="stat gws" id="st-gws"></span>
+  <span class="stat"><b id="st-writes">–</b><i>writes/s</i></span>
+  <span class="stat"><b id="st-lag">–</b><i>consumer lag</i></span>
+  <span class="grow"></span>
+  <span class="stat-age" id="st-age"></span>
+</div>
+
+<div id="workspace">
+<aside id="roots" hidden>
+  <div class="roots-head"><span>namespaces</span><span class="grow"></span><button id="roots-refresh" title="refresh (the gateway caches this for 10s)">&#8635;</button></div>
+  <div class="roots-note" id="roots-note">not loaded</div>
+</aside>
+<div id="tree"><div class="empty"><b>Not connected</b><span id="empty-hint">Sign in to begin.</span></div></div>
+</div>
+
+<footer>
+  Expand a node to <code>listen</code> on it; collapse to <code>unlisten</code>. Root is never
+  listened to — a whole-shard snapshot is what <code>SNAPSHOT_MAX</code> exists to refuse (§3).
+  The filter only dims nodes already loaded; it never issues a listen.
+  Metrics live in Grafana.<span id="foot-token" hidden><br>
+  Token: <code>node --import tsx scripts/console-token.ts --name &lt;you&gt;</code> — one hour, named,
+  revocable. Do not paste a long-lived production token here.</span>
+</footer>
+
+<script id="rtdb-mirror">
+// ===========================================================================================
+// PROTOCOL.md §1/§7 mirror, ported from harness/mirror.ts + src/protocol/path.ts + storage/tree.ts.
+// Extracted verbatim by test/unit/console-mirror.test.ts, so this block is the tested artifact
+// rather than a copy of one. Keep it dependency-free and side-effect-free.
+// ===========================================================================================
+const segments = (p) => (p === '' ? [] : p.split('/'));
+const joinPath = (base, rel) => (base === '' ? rel : rel === '' ? base : base + '/' + rel);
+const isAncestorOrEqual = (a, b) => a === '' || a === b || b.startsWith(a + '/');
+const isRelevant = (a, b) => isAncestorOrEqual(a, b) || isAncestorOrEqual(b, a);
+function ancestorsInclusive(path) {
+  const out = [''], segs = segments(path);
+  for (let i = 0; i < segs.length; i++) out.push(segs.slice(0, i + 1).join('/'));
+  return out;
+}
+const relativePath = (anc, p) => (anc === '' ? p : p.slice(anc.length + 1));
+
+/** §1: null and {} produce NO leaves; arrays are opaque leaf values, Firebase-style. */
+function flatten(path, value) {
+  const leaves = [];
+  const walk = (at, v) => {
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      for (const [k, child] of Object.entries(v)) walk(joinPath(at, k), child);
+      return;
+    }
+    if (v === null) return;
+    leaves.push({ path: at, value: v });
+  };
+  walk(path, value);
+  return leaves;
+}
+
+/** Rebuild the value rooted at `root` from its leaves. No leaves -> null (§1). */
+function unflatten(root, leaves) {
+  if (leaves.length === 0) return null;
+  const exact = leaves.find((l) => l.path === root);
+  if (exact) return exact.value;
+  const out = {};
+  for (const leaf of leaves) {
+    const segs = segments(relativePath(root, leaf.path));
+    let node = out;
+    for (let i = 0; i < segs.length - 1; i++) {
+      const key = segs[i], next = node[key];
+      node = (next === undefined || next === null || typeof next !== 'object' || Array.isArray(next))
+        ? (node[key] = {}) : next;
+    }
+    node[segs[segs.length - 1]] = leaf.value;
+  }
+  return out;
+}
+
+/**
+ * §7 serverState with per-leaf rev LWW and tombstones. There is no pendingOverlay here: this client
+ * is read-only, so `view === serverState` by construction and the overlay layer would be dead code.
+ */
+class Mirror {
+  constructor() { this.cells = new Map(); }
+
+  /** §3 + §7 (v1.3): a leaf or tombstone recorded ABOVE the snapshot's rev survives it. */
+  applySnapshot(path, value, rev) { this.write(path, value, rev); }
+
+  applyDelta(d) {
+    if (d.op === 'merge') {
+      for (const [key, child] of Object.entries(d.value || {})) this.write(joinPath(d.path, key), child, d.rev);
+      return;
+    }
+    this.write(d.path, d.value, d.rev);
+  }
+
+  /** §2 (v1.5): an epoch change means every rev we hold is from a dead generation. */
+  dropServerState() { this.cells.clear(); }
+
+  /** §7 LWW: a delta older than a leaf's recorded rev — or than a tombstone above it — is stale. */
+  stale(path, rev) {
+    for (const a of ancestorsInclusive(path)) {
+      const cell = this.cells.get(a);
+      if (cell && cell.rev > rev) return true;
+    }
+    return false;
+  }
+
+  write(path, value, rev) {
+    if (this.stale(path, rev)) return;
+    for (const [p, c] of [...this.cells]) {
+      if (isAncestorOrEqual(path, p) && c.rev <= rev) this.cells.delete(p);
+    }
+    // A scalar at an ancestor gives way: storage keeps the tree prefix-free and never emits a delta
+    // for the ancestor it silently replaced, so the client infers that clear itself (§7, v1.4).
+    // Tombstones above us are LEFT in place — they still guard against older deltas.
+    for (const a of ancestorsInclusive(path)) {
+      if (a === path) continue;
+      const c = this.cells.get(a);
+      if (c && !c.deleted && c.rev <= rev) this.cells.delete(a);
+    }
+    // The tombstone covers the whole cleared subtree, not just leaves we happened to hold.
+    this.cells.set(path, { rev, deleted: true, value: null });
+    for (const leaf of flatten(path, value)) {
+      if (this.stale(leaf.path, rev)) continue;
+      // §7: every EXTRACTED leaf is stamped with the delta's rev, not just the root.
+      this.cells.set(leaf.path, { rev, deleted: false, value: leaf.value });
+    }
+  }
+
+  value(root) {
+    const leaves = [];
+    for (const [p, c] of this.cells) if (!c.deleted && isAncestorOrEqual(root, p)) leaves.push({ path: p, value: c.value });
+    return unflatten(root, leaves);
+  }
+
+  /** Direct children of `root`, as [key, isLeaf, value] — what the tree view renders. */
+  children(root) {
+    const seen = new Map();
+    for (const [p, c] of this.cells) {
+      if (c.deleted || !isAncestorOrEqual(root, p) || p === root) continue;
+      const key = segments(relativePath(root, p))[0];
+      const child = joinPath(root, key);
+      if (!seen.has(key)) seen.set(key, { key, path: child, leaf: child === p, value: child === p ? c.value : undefined });
+    }
+    return [...seen.values()].sort((a, b) => (a.key < b.key ? -1 : 1));
+  }
+}
+if (typeof module === 'object') module.exports = { Mirror, flatten, unflatten, ancestorsInclusive, isAncestorOrEqual, isRelevant, joinPath, segments };
+</script>
+<script id="rtdb-wire">
+// ===========================================================================================
+// What may leave this page, and how a typed value is read. Extracted verbatim by
+// test/unit/console-wire.test.ts, so this block — like the mirror above it — is the tested
+// artifact rather than a copy of one. Keep it dependency-free and side-effect-free.
+// ===========================================================================================
+
+/** What a read-only console has always been allowed to send. */
+const READ_FRAMES = new Set(['hello', 'listen', 'unlisten', 'ping']);
+/** The roles the gateway will accept a write from (§5.9). Mirrored here to decide what to OFFER. */
+const WRITE_ROLES = new Set(['editor', 'owner']);
+
+/**
+ * §5.9's unlock, and the narrower of its two layers.
+ *
+ * `put` is the ONLY write frame this console constructs: set-value, add-child and delete are all
+ * puts (a delete is a put of null, §4), so `merge` and `cas` stay refused here and nothing is lost.
+ *
+ * This is the CONVENIENCE half. The law is the gateway's: it refuses a write from any subject that
+ * is not `console-rw-…` carrying an editor or owner role, whatever this function believes. When the
+ * two disagree — a demoted editor holding a stale page, say — the gateway wins and the page renders
+ * the RULES error it gets back. A guard in a browser is a courtesy to the user, never a control.
+ */
+function outboundAllowed(type, role) {
+  if (READ_FRAMES.has(type)) return true;
+  if (type === 'put') return WRITE_ROLES.has(role);
+  return false;
+}
+
+/**
+ * The typed editor (demo v2's selector shape). Returns {ok:true, value} or {ok:false, msg} and never
+ * throws: a person typing JSON into a box is an ordinary event, not an exceptional one.
+ */
+function parseTypedValue(kind, raw) {
+  switch (kind) {
+    case 'string':
+      return { ok: true, value: raw };
+    case 'number': {
+      const t = String(raw).trim();
+      if (t === '') return { ok: false, msg: 'a number is required' };
+      const n = Number(t);
+      return Number.isFinite(n) ? { ok: true, value: n } : { ok: false, msg: `"${raw}" is not a number` };
+    }
+    case 'boolean': {
+      const t = String(raw).trim().toLowerCase();
+      if (t === 'true') return { ok: true, value: true };
+      if (t === 'false') return { ok: true, value: false };
+      return { ok: false, msg: 'a boolean is true or false' };
+    }
+    case 'json':
+      try { return { ok: true, value: JSON.parse(raw) }; }
+      catch (e) { return { ok: false, msg: 'invalid JSON: ' + e.message }; }
+    case 'null':
+      return { ok: true, value: null };   // §4: the delete IS a put of null
+    default:
+      return { ok: false, msg: 'unknown type ' + kind };
+  }
+}
+
+/** §4: every write carries its own UUIDv4, which is what makes a retry safe (§1, within retention). */
+function buildPut(path, value) {
+  return { type: 'put', writeId: crypto.randomUUID(), path, value };
+}
+
+/**
+ * What the person who clicked Save is told. Every outcome says something — a refusal that renders as
+ * silence is indistinguishable from a save that worked, and the one the wire refuses is exactly the
+ * one the operator most needs to see.
+ */
+function writeOutcomeMessage(f) {
+  if (!f) return { ok: false, text: 'no answer from the server — the write may not have been sent' };
+  if (f.type === 'ack') return { ok: true, text: 'saved — rev ' + f.rev };
+  if (f.type === 'casFail') return { ok: false, text: 'the value changed underneath this edit' };
+  if (f.type === 'err') {
+    if (f.code === 'RULES') {
+      return { ok: false, text: 'refused by the server: this session may not write (RULES). '
+        + 'Your role may have changed — sign in again.' };
+    }
+    return { ok: false, text: 'refused by the server: ' + f.code + (f.msg ? ' — ' + f.msg : '') };
+  }
+  return { ok: false, text: 'unexpected reply: ' + f.type };
+}
+
+if (typeof module === 'object') {
+  module.exports = { outboundAllowed, parseTypedValue, buildPut, writeOutcomeMessage, READ_FRAMES, WRITE_ROLES };
+}
+</script>
+<script>
+// =========================================================================== connection + UI
+const $ = (s) => document.querySelector(s);
+
+// Served by auth-server.mjs over http(s), or opened as a bare file:// ? It decides how a token is
+// obtained, and therefore whether a token field exists at all. Read by render(), so it is declared
+// here rather than beside the sign-in code that uses it most.
+const SERVED = location.protocol === 'http:' || location.protocol === 'https:';
+
+const mirror = new Mirror();
+const subs = new Map();            // subId -> {path, lastRev, err}
+const watched = new Map();         // path -> {expanded, subId, json}
+let ws = null, epoch = null, subSeq = 0, attempt = 0, pingTimer = null, pongTimer = null, retryTimer = null;
+let token = '', url = '', manualClose = false;
+
+// When served, the token comes back from POST /login and lives here — in memory, no cookie, no
+// localStorage, gone when the tab closes. `tokenEl` is null in that case because the field is gone.
+let authToken = '';
+// The role the sign-in returned. It decides what this page OFFERS; it decides nothing about what the
+// server allows — /users checks the claim in the token on every call, because a hidden button is not
+// an access control and this variable is one edit away in any browser's console.
+let myRole = '';
+const tokenEl = SERVED ? null : $('input[name=token]');
+if (SERVED) $('input[name=token]').remove();
+
+// The markup ships the served wording; on file:// the only way in IS the token field, so say so.
+// render() branches the same way, but it has not run yet at first paint.
+$('#empty-hint').textContent = SERVED ? 'Sign in to begin.'
+                                      : 'Paste a token and connect, then watch a path.';
+// Signing in is the whole path when served; how to mint a token by hand is noise the operator does
+// not need and was explicitly asked not to see. It stays for the file:// fallback, where it is the
+// only instruction that matters.
+$('#foot-token').hidden = SERVED;
+
+const PILL = { connected:'ok', connecting:'warn', waiting:'warn', idle:'warn', 'auth failed':'bad', closed:'bad' };
+var setState = function (s) {
+  $('#s-state-t').textContent = s;
+  $('#s-state').className = 'pill ' + (PILL[s] || 'warn');
+};
+const showErr = (m) => { $('#s-err').textContent = m || ''; };
+
+function send(frame) {
+  // The decision lives in the rtdb-wire block above, where a test can reach the SHIPPED copy of it.
+  // Read frames always; `put` only for a role the gateway would accept one from — and the gateway
+  // is the one that actually decides (§5.9).
+  if (!outboundAllowed(frame.type, myRole)) {
+    throw new Error('this console session may not send ' + frame.type);
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+}
+
+/** Whether to OFFER editing. What happens if the offer is wrong is the gateway's business. */
+const canWrite = () => WRITE_ROLES.has(myRole);
+
+/**
+ * In-flight writes, by writeId. A write that is never answered must not sit here silently: P1's
+ * lesson, and the demo's, is that "neither resolved nor rejected" is the one outcome a person cannot
+ * act on — so every write gets a deadline and every deadline reports.
+ */
+const pendingWrites = new Map();
+const WRITE_TIMEOUT_MS = 15000;
+
+function writeNode(path, value, done) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return done({ ok: false, text: 'not connected — this write was never sent' });
+  }
+  let frame;
+  try {
+    frame = buildPut(path, value);
+    send(frame);
+  } catch (e) {
+    return done({ ok: false, text: e.message });
+  }
+  const timer = setTimeout(() => {
+    if (pendingWrites.delete(frame.writeId)) done(writeOutcomeMessage(null));
+  }, WRITE_TIMEOUT_MS);
+  pendingWrites.set(frame.writeId, (reply) => {
+    clearTimeout(timer);
+    done(writeOutcomeMessage(reply));
+  });
+}
+
+/** True when this frame answered a write we are waiting on; the caller then stops handling it. */
+function settleWrite(f) {
+  if (f.writeId === undefined) return false;
+  const done = pendingWrites.get(f.writeId);
+  if (!done) return false;
+  pendingWrites.delete(f.writeId);
+  done(f);
+  return true;
+}
+
+function connect() {
+  url = $('input[name=url]').value.trim();
+  token = tokenEl ? tokenEl.value : authToken;
+  if (!url || !token) return showErr('url and token are both required');
+  manualClose = false;
+  open();
+}
+
+function open() {
+  clearTimeout(retryTimer);
+  setState('connecting'); showErr('');
+  ws = new WebSocket(url);
+  ws.onopen = () => send({ type: 'hello', proto: 1, token, sdk: 'console/1.0.0' });
+  ws.onmessage = (e) => { let f; try { f = JSON.parse(e.data); } catch { return; } onFrame(f); };
+  ws.onclose = (e) => {
+    stopPings();
+    if (manualClose) { setState('idle'); return; }
+    setState('waiting');
+    // §6: an auth-rejected close must not be retried with the same token. Surface it and stop.
+    if (e.code === 4401) { setState('auth failed'); showErr('4401 — token rejected; mint a new one'); return; }
+    if (e.code === 4403) showErr('4403 — kicked (§10)');
+    const delay = Math.random() * Math.min(30000, 1000 * 2 ** attempt++);  // §6 full jitter, cap 30s
+    retryTimer = setTimeout(open, delay);
+  };
+}
+
+function onFrame(f) {
+  if (f.type === 'batch') { for (const inner of f.frames || []) onFrame(inner); return; }
+  switch (f.type) {
+    case 'helloAck': {
+      // §2 (v1.5): a different epoch means the shard was restored or reset — drop everything we
+      // hold BEFORE re-listening, so the re-listens come back as fresh snapshots.
+      if (epoch !== null && epoch !== f.epoch) { mirror.dropServerState(); for (const s of subs.values()) s.lastRev = 0; }
+      epoch = f.epoch;
+      attempt = 0;
+      $('#s-epoch').textContent = f.epoch;
+      $('#s-rev').textContent = f.rev;
+      setState('connected');
+      showConnected();
+      for (const [path, w] of watched) if (w.expanded) listen(path, true);
+      loadRoots(false);
+      startPings();
+      render();
+      return;
+    }
+    case 'pong': clearTimeout(pongTimer); pongTimer = null; return;
+    case 'ack':
+    case 'casFail':
+      settleWrite(f);
+      return;
+    case 'snapshot': {
+      const sub = subs.get(f.subId); if (!sub) return;
+      mirror.applySnapshot(f.path, f.value, f.rev);
+      sub.lastRev = f.rev; sub.err = null;
+      bumpRev(f.rev); render(f.path);
+      return;
+    }
+    case 'delta': {
+      mirror.applyDelta(f);
+      // Deltas carry no subId (§3): every sub the path is relevant to advances. Gaps are NORMAL.
+      for (const s of subs.values()) if (isRelevant(s.path, f.path)) s.lastRev = Math.max(s.lastRev, f.rev);
+      bumpRev(f.rev); render(f.path);
+      return;
+    }
+    case 'resync': {
+      // §3: mark stale, do NOT clear — the snapshot that follows replaces it.
+      const sub = subs.get(f.subId); if (sub) sub.err = 'resyncing…';
+      render();
+      return;
+    }
+    case 'err': {
+      // A write's err belongs to the editor that issued it, not to the status bar: it is the answer
+      // to something a person just did, and it renders where they are looking.
+      if (settleWrite(f)) return;
+      if (f.subId !== undefined) {
+        const sub = subs.get(f.subId);
+        if (sub) { sub.err = f.code + ': ' + f.msg; const w = watched.get(sub.path); if (w) w.expanded = false; subs.delete(f.subId); }
+        $('#s-subs').textContent = subs.size;
+        render();
+        return;
+      }
+      showErr(f.code + ': ' + f.msg);
+      return;
+    }
+  }
+  // Unknown frame types are IGNORED, never errors (Transport rule).
+}
+
+function bumpRev(rev) {
+  const cur = Number($('#s-rev').textContent) || 0;
+  if (rev > cur) $('#s-rev').textContent = rev;
+}
+
+function startPings() {
+  stopPings();
+  const ping = () => {
+    send({ type: 'ping', t: Date.now() });
+    pongTimer = setTimeout(() => { if (ws) ws.close(1000, 'pong timeout'); }, 10000); // §5
+    pingTimer = setTimeout(ping, 25000);                                              // §5 foreground
+  };
+  ping();
+}
+function stopPings() { clearTimeout(pingTimer); clearTimeout(pongTimer); pingTimer = pongTimer = null; }
+
+function listen(path, force) {
+  if (path === '') return showErr('root is never listened to (§3 SNAPSHOT_MAX)');
+  const w = watched.get(path);
+  if (!force && w && w.subId != null) return;
+  const subId = ++subSeq;
+  subs.set(subId, { path, lastRev: 0, err: null });
+  if (w) w.subId = subId;
+  send({ type: 'listen', subId, path });
+  $('#s-subs').textContent = subs.size;
+}
+function unlisten(path) {
+  for (const [subId, s] of subs) if (s.path === path) { send({ type: 'unlisten', subId }); subs.delete(subId); }
+  const w = watched.get(path); if (w) w.subId = null;
+  $('#s-subs').textContent = subs.size;
+}
+
+// =========================================================================== tree rendering
+const typeOf = (v) => (v === null ? 'null' : Array.isArray(v) ? 'string' : typeof v);
+const fmt = (v) => (typeof v === 'string' ? JSON.stringify(v) : v === null ? 'null' : JSON.stringify(v));
+const prev = new Map();
+let filter = '';
+
+/*
+ * RENDER SCHEDULING. Every delta used to rebuild the whole tree synchronously, which is why clicks
+ * were lost under churn: the element under the pointer was destroyed between mousedown and click.
+ * Now renders coalesce onto one animation frame, and a frame that changes only VALUES patches the
+ * existing nodes in place instead of rebuilding them. Structure changes still rebuild — but a
+ * subtree gaining or losing a child is rare next to a number ticking.
+ */
+let renderQueued = false, pendingChanged = null;
+
+function render(changedPath) {
+  if (changedPath) pendingChanged = changedPath;
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const c = pendingChanged; pendingChanged = null;
+    needsFullRender() ? fullRender(c) : patchInPlace(c);
+  });
+}
+
+/** The shape of a branch's children, as drawn. Cheap enough to compute every frame. */
+function sigOf(path) {
+  return mirror.children(path).map((k) => k.key + (k.leaf ? '' : '/')).join(',');
+}
+
+function needsFullRender() {
+  const roots = rootPaths();
+  const drawn = [...document.querySelectorAll('#tree > .node')].map((n) => n.dataset.branch);
+  if (!roots.length || roots.length !== drawn.length) return true;
+  if (roots.some((r, i) => r !== drawn[i])) return true;
+  // Structure is not only the mirror's shape: whether a node is OPEN, and whether its JSON block is
+  // showing, decide what is drawn just as much. Comparing only the children signature meant a
+  // chevron click produced a value-patch and the node never opened.
+  for (const el of document.querySelectorAll('[data-branch]')) {
+    if (stateOf(el.dataset.branch) !== el.dataset.state) return true;
+    if (el.dataset.sig !== undefined && sigOf(el.dataset.branch) !== el.dataset.sig) return true;
+  }
+  return false;
+}
+
+/** Everything about a branch that changes its DRAWN shape, other than its children. */
+function stateOf(path) {
+  const w = watched.get(path);
+  return `${w && w.expanded ? 1 : 0}${w && w.json ? 'j' : ''}`;
+}
+
+/** Values only: no node is created or destroyed, so nothing under the pointer moves. */
+function patchInPlace(changedPath) {
+  for (const el of document.querySelectorAll('[data-vpath]')) {
+    const v = mirror.value(el.dataset.vpath);
+    const t = fmt(v);
+    if (el.textContent !== t) { el.textContent = t; el.className = 'val t-' + typeOf(v); }
+  }
+  for (const el of document.querySelectorAll('[data-count]')) {
+    const path = el.dataset.count;
+    const self = mirror.value(path);
+    const sub = [...subs.values()].find((x) => x.path === path);
+    const scalar = self !== null && typeof self !== 'object';
+    const kids = mirror.children(path);
+    el.textContent = scalar ? '' : kids.length ? `${kids.length}` : (sub && !sub.err ? 'empty' : '');
+  }
+  if (filter) applyFilter();
+  if (changedPath) flash(changedPath);
+}
+
+/** Watched paths with no watched ancestor — the trees actually drawn at top level. */
+function rootPaths() {
+  const all = [...watched.keys()];
+  return all.filter((p) => !all.some((q) => q !== p && isAncestorOrEqual(q, p)));
+}
+
+function fullRender(changedPath) {
+  const tree = $('#tree');
+  tree.textContent = '';
+  // Only watched paths with no watched ANCESTOR are roots. Without this, expanding a child (which
+  // records its own watch, because collapse must be able to unlisten it) would draw that child a
+  // second time as a top-level tree.
+  const roots = rootPaths();
+  if (!roots.length) {
+    const d = document.createElement('div');
+    d.className = 'empty';
+    const t = document.createElement('b');
+    t.textContent = ws && epoch !== null ? 'Connected' : 'Not connected';
+    d.appendChild(t);
+    d.appendChild(document.createTextNode(
+      ws && epoch !== null ? 'Watch a path to begin browsing the shard.'
+                           : SERVED ? 'Sign in to begin.'
+                                    : 'Paste a token and connect, then watch a path.'));
+    tree.appendChild(d);
+    return;
+  }
+  for (const path of roots) tree.appendChild(nodeEl(path, path, watched.get(path).expanded));
+  if (filter) applyFilter();
+  if (changedPath) flash(changedPath);
+}
+
+function rowEl({ path, label, branch, expanded, value, hasValue }) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.dataset.path = path;
+
+  // Two targets, two meanings, the way a file tree behaves: the chevron opens the node WHERE IT IS,
+  // the name goes INTO it. Both on the same row, so the split has to be unambiguous.
+  const tw = document.createElement('span');
+  tw.className = 'tw' + (branch ? (expanded ? ' open' : '') : ' leaf');
+  tw.textContent = '▸';
+  if (branch) tw.onclick = (e) => { e.stopPropagation(); toggle(path); };
+  row.appendChild(tw);
+
+  const key = document.createElement('span');
+  key.className = 'key' + (branch ? ' branch' : '');
+  key.textContent = branch ? label : label + ':';
+  if (branch && path !== currentRoot()) {
+    key.classList.add('drill');
+    key.title = 'open ' + path;
+    key.onclick = (e) => { e.stopPropagation(); drillTo(path); };
+  }
+  row.appendChild(key);
+
+  if (hasValue) {
+    const v = document.createElement('span');
+    v.className = 'val t-' + typeOf(value);
+    v.textContent = fmt(value);
+    v.dataset.vpath = path;
+    row.appendChild(v);
+  }
+  if (branch) {
+    const n = document.createElement('span');
+    n.className = 'count';
+    n.dataset.count = path;
+    row.appendChild(n);
+  }
+
+  const tools = document.createElement('span');
+  tools.className = 'tools';
+  // Offered only to a role the gateway would accept a write from. This is not the guard: a viewer
+  // who conjures the frame anyway is refused at the wire (§5.9), which is where refusing belongs.
+  if (canWrite()) {
+    if (!branch) {
+      tools.appendChild(toolBtn('set', 'set this value', (e) => { e.stopPropagation(); openEditor('set', path); }));
+    } else {
+      tools.appendChild(toolBtn('add', 'add a child under this node', (e) => { e.stopPropagation(); openEditor('add', path); }));
+    }
+    tools.appendChild(toolBtn('delete', 'delete this node', (e) => { e.stopPropagation(); deleteNode(path, branch); }));
+    tools.lastChild.classList.add('danger');
+  }
+  tools.appendChild(toolBtn('copy', 'copy path', (e) => {
+    e.stopPropagation();
+    navigator.clipboard?.writeText(path);
+    e.target.textContent = 'copied';
+    setTimeout(() => (e.target.textContent = 'copy'), 900);
+  }));
+  if (branch) {
+    const w = watched.get(path);
+    tools.appendChild(toolBtn(w && w.json ? 'hide json' : 'json', 'view this node as JSON', (e) => {
+      e.stopPropagation();
+      const ww = watched.get(path) || {};
+      ww.json = !ww.json;
+      watched.set(path, ww);
+      render();
+    }));
+  }
+  row.appendChild(tools);
+  if (branch) row.onclick = () => toggle(path);
+  return row;
+}
+
+function toolBtn(text, title, onclick) {
+  const b = document.createElement('button');
+  b.className = 'link'; b.textContent = text; b.title = title; b.onclick = onclick;
+  return b;
+}
+
+function nodeEl(path, label, expanded) {
+  const box = document.createElement('div');
+  box.className = 'node';
+  box.dataset.branch = path;
+  box.dataset.state = stateOf(path);
+  const sub = [...subs.values()].find((s) => s.path === path);
+  const self = mirror.value(path);
+  const scalar = expanded && self !== null && typeof self !== 'object';
+
+  box.appendChild(rowEl({ path, label, branch: true, expanded, value: self, hasValue: scalar }));
+
+  if (sub && sub.err) box.appendChild(errEl(sub.err));
+  if (!expanded) return box;
+
+  const kids = mirror.children(path);
+  box.dataset.sig = sigOf(path);
+  const badge = box.querySelector(`[data-count="${CSS.escape(path)}"]`);
+  if (badge) badge.textContent = scalar ? '' : kids.length ? `${kids.length}` : (sub && !sub.err ? 'empty' : '');
+
+  const w = watched.get(path);
+  if (w && w.json) {
+    const pre = document.createElement('div');
+    pre.className = 'json';
+    const cap = document.createElement('span');
+    cap.className = 'json-cap';
+    cap.textContent = path + ' — from the mirror, no listen';
+    pre.appendChild(cap);
+    // Straight from the mirror — no listen, no round trip. This is the same value the tree shows.
+    pre.appendChild(document.createTextNode(JSON.stringify(self, null, 2)));
+    box.appendChild(pre);
+  }
+
+  for (const k of kids) {
+    if (k.leaf) {
+      const leaf = document.createElement('div');
+      leaf.className = 'node';
+      leaf.appendChild(rowEl({ path: k.path, label: k.key, branch: false, value: k.value, hasValue: true }));
+      box.appendChild(leaf);
+    } else {
+      box.appendChild(nodeEl(k.path, k.key, watched.get(k.path)?.expanded ?? false));
+    }
+  }
+  return box;
+}
+
+function errEl(msg) {
+  const e = document.createElement('div');
+  e.className = 'err';
+  e.textContent = msg;
+  if (msg.startsWith('TOOBIG')) {
+    const b = document.createElement('small');
+    b.textContent = 'This subtree is past SNAPSHOT_MAX — expand a child instead (§3).';
+    e.appendChild(b);
+  }
+  return e;
+}
+
+// =========================================================================== drill-down + path bar
+/** The single watched root, or '' when nothing is watched. */
+function currentRoot() { const r = rootPaths(); return r.length === 1 ? r[0] : ''; }
+
+/**
+ * Make `path` the watched root. Everything previously watched is UNLISTENED first — re-rooting
+ * replaces the view wholesale, and a subscription whose node is no longer on screen is one nobody
+ * will ever collapse to release. §3's listen/unlisten pairing is the whole point; leaking them
+ * would quietly grow the server's fan-out set for a tree the operator has walked away from.
+ */
+function drillTo(path) {
+  const p = String(path || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!p) return showErr('root is never listened to (§3 SNAPSHOT_MAX)');
+  if (p === currentRoot()) { syncPathBar(); return; }
+  for (const old of [...watched.keys()]) unlisten(old);
+  watched.clear();
+  watched.set(p, { expanded: true, subId: null, json: false });
+  listen(p);
+  showErr('');
+  syncPathBar();
+  render();
+}
+
+$('#roots-refresh').addEventListener('click', () => loadRoots(true));
+
+/**
+ * §5.6: the root namespaces. Served by the ops auth-server, which proxies the gateway's ADMIN port —
+ * this never goes over the wire protocol, because §3 has no way to ask "what is at the top" and
+ * TOOBIG is the correct answer to listening on root.
+ *
+ * Only in SERVED mode: opened as a file there is no auth-server to ask, and a sidebar that is
+ * permanently empty is worse than no sidebar.
+ */
+async function loadRoots(manual) {
+  if (!SERVED) return;
+  const note = $('#roots-note');
+  const aside = $('#roots');
+  aside.hidden = false;
+  if (manual) note.textContent = 'loading…';
+  try {
+    const r = await fetch('/topnodes', { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    renderRoots(Array.isArray(d.names) ? d.names : []);
+  } catch (e) {
+    // A sidebar that cannot load must not take the console down with it.
+    note.hidden = false;
+    note.textContent = 'unavailable';
+    for (const b of [...aside.querySelectorAll('.root')]) b.remove();
+  }
+}
+
+function renderRoots(names) {
+  const aside = $('#roots');
+  const note = $('#roots-note');
+  for (const b of [...aside.querySelectorAll('.root')]) b.remove();
+  if (!names.length) { note.hidden = false; note.textContent = 'no namespaces yet'; return; }
+  note.hidden = true;
+  const here = currentRoot().split('/')[0];
+  for (const name of names) {
+    const b = document.createElement('button');
+    b.className = 'root';
+    b.type = 'button';
+    b.textContent = name;
+    if (name === here) b.setAttribute('aria-current', 'true');
+    // Click = drill in, through the SAME navigation the path bar uses. The sidebar chooses a
+    // destination; it does not get its own way of getting there.
+    b.addEventListener('click', () => { drillTo(name); renderRoots(names); });
+    aside.appendChild(b);
+  }
+}
+
+/** The bar always reads the real watched root. It is rendered from state, never typed into by us. */
+function syncPathBar() {
+  const root = currentRoot();
+  const crumbs = $('#crumbs');
+  crumbs.textContent = '';
+  if (!root) {
+    const h = document.createElement('span');
+    h.className = 'hint';
+    h.textContent = 'click to type a path, e.g. demo/room';
+    crumbs.appendChild(h);
+    return;
+  }
+  const parts = root.split('/');
+  parts.forEach((seg, i) => {
+    if (i) { const sep = document.createElement('span'); sep.className = 'sep'; sep.textContent = '/'; crumbs.appendChild(sep); }
+    const el = document.createElement('span');
+    el.className = 'seg' + (i === parts.length - 1 ? ' last' : '');
+    el.textContent = seg;
+    if (i < parts.length - 1) {
+      const upto = parts.slice(0, i + 1).join('/');
+      el.title = 'go to ' + upto;
+      // Stop it here: the container's own click opens the editor, and a segment click that bubbles
+      // would navigate AND drop into edit mode at the same time.
+      el.onclick = (e) => { e.stopPropagation(); drillTo(upto); };
+    }
+    crumbs.appendChild(el);
+  });
+}
+
+function openPathEditor() {
+  const inp = $('#path-edit');
+  inp.value = currentRoot();
+  $('#crumbs').hidden = true;
+  inp.hidden = false;
+  inp.focus(); inp.select();
+}
+function closePathEditor() { $('#path-edit').hidden = true; $('#crumbs').hidden = false; }
+
+function toggle(path) {
+  let w = watched.get(path);
+  if (!w) { w = { expanded: false, subId: null, json: false }; watched.set(path, w); }
+  w.expanded = !w.expanded;
+  if (w.expanded) listen(path); else { unlisten(path); dropSubtreeWatches(path); }
+  syncPathBar();
+  render();
+}
+
+/** Collapsing a node also forgets its descendants' expansion state — otherwise re-expanding it
+ *  would silently re-listen to a whole subtree the operator did not ask for. */
+function dropSubtreeWatches(root) {
+  for (const [p, w] of [...watched]) {
+    if (p !== root && isAncestorOrEqual(root, p)) { unlisten(p); watched.delete(p); }
+    else if (p === root) { w.expanded = false; w.json = false; }
+  }
+}
+
+/**
+ * Filter dims what is ALREADY LOADED. It never issues a listen — searching a shard you have not
+ * loaded is a server-side query (§11 E2) and this tool deliberately does not have one.
+ *
+ * A row survives if it matches, or if anything loaded BENEATH it matches: otherwise searching for a
+ * key that lives two levels down dims the entire tree and hides the very path you were looking for.
+ * The haystack is the mirror's own cells, so a collapsed node still leads you to its match.
+ */
+function matchesBelow(path, q) {
+  for (const [p, c] of mirror.cells) {
+    if (c.deleted || !isAncestorOrEqual(path, p)) continue;
+    if (p.toLowerCase().includes(q)) return true;
+    if (String(c.value).toLowerCase().includes(q)) return true;
+  }
+  return false;
+}
+
+function applyFilter() {
+  const q = filter.toLowerCase();
+  for (const row of document.querySelectorAll('.row')) {
+    const path = row.dataset.path || '';
+    const hit = row.textContent.toLowerCase().includes(q) || matchesBelow(path, q);
+    row.classList.toggle('dim', !hit);
+  }
+}
+
+function flash(path) {
+  for (const el of document.querySelectorAll('[data-vpath]')) {
+    const p = el.dataset.vpath;
+    if (!p || !isRelevant(p, path)) continue;
+    if (prev.get(p) !== el.textContent) { el.classList.add('flash'); prev.set(p, el.textContent); }
+  }
+}
+
+function showConnected() {
+  $('#connect-form').style.display = 'none';
+  $('#connected-form').style.display = '';
+  $('#c-url').textContent = url;
+  $('#pathbar').hidden = false;
+  syncPathBar();
+}
+
+$('#go').onclick = connect;
+tokenEl?.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+$('#disconnect').onclick = () => {
+  manualClose = true;
+  clearTimeout(retryTimer); stopPings();
+  if (ws) ws.close(1000, 'operator');
+  ws = null; epoch = null; subs.clear(); watched.clear(); mirror.dropServerState();
+  $('#s-subs').textContent = '0'; $('#s-epoch').textContent = '–'; $('#s-rev').textContent = '–';
+  $('#connect-form').style.display = '';
+  $('#connected-form').style.display = 'none';
+  $('#pathbar').hidden = true; closePathEditor();
+  setState('idle'); showErr(''); render();
+};
+// The bar is the source of truth in both directions: it renders from the watched root, and typing
+// into it navigates. Watch commits the editor when open, and opens it when not.
+$('#crumbs').onclick = openPathEditor;
+$('#add').onclick = () => {
+  if ($('#path-edit').hidden) return openPathEditor();
+  const p = $('#path-edit').value.trim().replace(/^\/+|\/+$/g, '');
+  if (!p) return showErr('a path is required — root is not watchable (§3)');
+  closePathEditor();
+  drillTo(p);
+};
+$('#path-edit').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('#add').click();
+  if (e.key === 'Escape') { closePathEditor(); syncPathBar(); }
+});
+$('#path-edit').addEventListener('blur', () => { if (!$('#path-edit').hidden) { closePathEditor(); syncPathBar(); } });
+$('#filter').addEventListener('input', (e) => { filter = e.target.value.trim(); render(); });
+
+/**
+ * Served over http(s), the page asks for email + password and gets a one-hour token back from
+ * auth-server.mjs. Opened as a file:// (Gate A/B behaviour, and the fallback if the service is
+ * down), it keeps the paste-a-token form instead. The token lives in memory either way — no cookie,
+ * no localStorage, gone when the tab closes.
+ */
+if (SERVED) {
+  $('#login').hidden = false;
+  $('#login-card').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('#login-go'), err = $('#login-err');
+    const email = $('#login-card input[name=email]').value.trim();
+    const password = $('#login-card input[name=password]').value;
+    btn.disabled = true; btn.textContent = 'Signing in…'; err.textContent = '';
+    try {
+      const r = await fetch('/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        err.textContent = r.status === 429
+          ? `Too many attempts. Try again in ${Math.ceil((d.retryInSeconds ?? 900) / 60)} minutes.`
+          : (d.error || 'Sign-in failed');
+        return;
+      }
+      $('#login-card input[name=password]').value = '';   // do not leave it in the DOM
+      authToken = d.token;
+      myRole = d.role || '';
+      $('#users-btn').hidden = myRole !== 'owner';
+      // The tag has said "read-only" since this console existed. For a session that can write, that
+      // is now a lie, and the one thing a person should never be wrong about is whether their clicks
+      // change production.
+      //
+      // It carries the LOCALPART, not the subject: the localpart is unique by the rule that refuses
+      // two users to share one (§5.8 F3), so it matches an audit line exactly — while nothing
+      // token-shaped goes on screen during a screen-share.
+      const me = (d.sub || '').replace(/^console-(?:rw-)?/, '');
+      $('#mode-tag').textContent = (canWrite() ? 'rw · ' : 'read-only · ') + me;
+      startStats();
+      $('#login').hidden = true;
+      connect();
+    } catch {
+      err.textContent = 'Could not reach the sign-in service.';
+    } finally {
+      btn.disabled = false; btn.textContent = 'Sign in';
+    }
+  });
+}
+
+/* --------------------------------------------------------------------------- users (owner only)
+ * Add, re-role and remove console users. Everything here is a request to /users, which is the thing
+ * that actually decides: this panel is not shown to a non-owner, and would be refused if it were.
+ */
+const ucErr = (m) => { $('#uc-err').textContent = m || ''; };
+
+async function usersApi(method, body) {
+  const r = await fetch('/users', {
+    method,
+    headers: { authorization: `Bearer ${authToken}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  return d;
+}
+
+/**
+ * One password field and its show/hide, wherever a password is typed. The owner MUST be able to read
+ * what they are about to hand over out of band: a typo in a write-only field is not discovered here,
+ * it is discovered by a member who cannot sign in.
+ */
+function setReveal(input, button, shown) {
+  input.type = shown ? 'text' : 'password';
+  button.textContent = shown ? 'hide' : 'show';
+  button.setAttribute('aria-pressed', String(shown));
+}
+function bindReveal(input, button) {
+  setReveal(input, button, false);
+  button.addEventListener('click', () => {
+    setReveal(input, button, input.type !== 'text');
+    input.focus();
+  });
+}
+
+/** The same floor the server enforces; this copy only saves a round trip. The server decides. */
+const MIN_PASSWORD = 8;
+const passwordProblem = (pw) =>
+  pw.trim() === '' ? 'a password is required'
+  : pw.length < MIN_PASSWORD ? `a password must be at least ${MIN_PASSWORD} characters` : '';
+
+/**
+ * Reset one member's password, inline under their row. The store is hash-only, so there is nothing
+ * to show and nothing to recover — the owner types a new one and hands it over.
+ */
+function resetForm(email, done) {
+  const box = document.createElement('div');
+  box.className = 'uc-reset';
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.autocomplete = 'new-password';
+  input.spellcheck = false;
+  input.placeholder = `new password for ${email}`;
+  input.setAttribute('aria-label', `new password for ${email}`);
+  const show = document.createElement('button');
+  show.type = 'button'; show.textContent = 'show'; show.setAttribute('aria-pressed', 'false');
+  bindReveal(input, show);
+  const save = document.createElement('button');
+  save.type = 'button'; save.className = 'primary'; save.textContent = 'Set';
+  const cancel = document.createElement('button');
+  cancel.type = 'button'; cancel.textContent = 'cancel';
+  cancel.addEventListener('click', done);
+  save.addEventListener('click', async () => {
+    const bad = passwordProblem(input.value);
+    if (bad) return ucErr(bad);
+    ucErr(''); save.disabled = true;
+    try {
+      await usersApi('PUT', { email, password: input.value });
+      input.value = '';   // do not leave it in the DOM
+      done();
+      ucErr('');
+      $('#uc-note').textContent = `password set for ${email} — their open session lasts its hour`;
+    } catch (e) { ucErr(e.message); save.disabled = false; }
+  });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save.click(); });
+  box.append(input, show, save, cancel);
+  return box;
+}
+
+function renderUsers(d) {
+  const list = $('#uc-list');
+  list.textContent = '';
+  $('#uc-note').textContent = `signed in as ${d.you}`;
+  for (const u of d.users) {
+    const row = document.createElement('div');
+    row.className = 'uc-row';
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = u.email;
+    const isSelf = `console-${u.email.split('@')[0]}` === d.you;
+    if (isSelf) { const me = document.createElement('span'); me.className = 'you'; me.textContent = 'you'; who.append(' '); who.append(me); }
+    const sel = document.createElement('select');
+    sel.setAttribute('aria-label', `role for ${u.email}`);
+    for (const r of ['viewer', 'editor', 'owner']) {
+      const o = document.createElement('option');
+      // An inert role that reads as a live one is a small lie, and it is told on every row. Say it
+      // where the choice is made; the footnote below explains why.
+      o.value = r; o.textContent = r;
+      o.selected = r === u.role;
+      sel.append(o);
+    }
+    // The last owner and yourself are refused by the server too; disabling here is courtesy, not
+    // the guard. Trying it anyway returns 409 and the reason lands in the error line.
+    sel.disabled = isSelf;
+    sel.addEventListener('change', async () => {
+      ucErr('');
+      try { await usersApi('PATCH', { email: u.email, role: sel.value }); await loadUsers(); }
+      catch (e) { ucErr(e.message); await loadUsers(); }
+    });
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = 'remove';
+    del.disabled = isSelf;
+    del.addEventListener('click', async () => {
+      if (!confirm(`Remove ${u.email}? Their open session lasts until its token expires.`)) return;
+      ucErr('');
+      try { await usersApi('DELETE', { email: u.email }); await loadUsers(); }
+      catch (e) { ucErr(e.message); }
+    });
+    // Reset is allowed on EVERY row including your own: it is not a demotion, so the self-guards
+    // that disable the two controls above do not apply to it.
+    const pw = document.createElement('button');
+    pw.type = 'button';
+    pw.textContent = 'reset password';
+    row.append(who, sel, pw, del);
+    list.append(row);
+    pw.addEventListener('click', () => {
+      const open = row.nextElementSibling;
+      if (open && open.className === 'uc-reset') { open.remove(); pw.textContent = 'reset password'; return; }
+      ucErr('');
+      pw.textContent = 'cancel';
+      const form = resetForm(u.email, () => { form.remove(); pw.textContent = 'reset password'; });
+      row.after(form);
+      form.querySelector('input').focus();
+    });
+  }
+}
+
+async function loadUsers() {
+  try { renderUsers(await usersApi('GET')); }
+  catch (e) { ucErr(e.message); }
+}
+
+$('#users-btn').addEventListener('click', () => {
+  $('#uc-pw').hidden = true; ucErr('');
+  $('#users').hidden = false;
+  loadUsers();
+});
+$('#uc-close').addEventListener('click', () => { $('#users').hidden = true; });
+$('#users').addEventListener('click', (e) => { if (e.target === $('#users')) $('#users').hidden = true; });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#users').hidden) $('#users').hidden = true; });
+
+bindReveal($('#uc-pass'), $('#uc-show'));
+
+$('#uc-add').addEventListener('click', async () => {
+  const email = $('#uc-email').value.trim();
+  const role = $('#uc-role').value;
+  const password = $('#uc-pass').value;
+  if (!email) return ucErr('an email is required');
+  const bad = passwordProblem(password);
+  if (bad) return ucErr(bad);
+  ucErr(''); $('#uc-add').disabled = true;
+  try {
+    const d = await usersApi('POST', { email, role, password });
+    $('#uc-email').value = '';
+    $('#uc-pass').value = '';   // do not leave it in the DOM
+    setReveal($('#uc-pass'), $('#uc-show'), false);   // and back to hidden for the next one
+    const box = $('#uc-pw');
+    box.textContent = '';
+    if (d.password) {
+      // The pre-v2 path: no password was sent, so the server generated one and this response is the
+      // only place it will ever exist. Shown ONCE, handed over out of band.
+      box.append(`Password for ${d.email} (${d.role}) — shown once, hand it over out of band:`);
+      const code = document.createElement('code');
+      code.textContent = d.password;
+      box.append(code);
+    } else {
+      box.append(`${d.email} added as ${d.role}. They sign in with the password you just set — it is`
+        + ` stored hashed and cannot be shown again, so hand it over now.`);
+    }
+    box.hidden = false;
+    await loadUsers();
+  } catch (e) { ucErr(e.message); }
+  finally { $('#uc-add').disabled = false; }
+});
+for (const el of [$('#uc-email'), $('#uc-pass')]) {
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#uc-add').click(); });
+}
+
+/* --------------------------------------------------------------------------- the editor
+ * Set a value, add a child, delete a node. One dialog for all three, and it lives OUTSIDE #tree on
+ * purpose: the tree re-renders whenever a delta lands, and an editor spliced into it would be swept
+ * away mid-typing by somebody else's write.
+ */
+let editTarget = null;
+
+const edMsg = (text, ok) => {
+  const el = $('#ed-msg');
+  el.textContent = text || '';
+  el.className = 'ed-msg' + (text ? (ok ? ' ok' : ' bad') : '');
+};
+
+function openEditor(mode, path) {
+  editTarget = { mode, path };
+  $('#ed-title').textContent = mode === 'add' ? 'Add a child' : 'Set value';
+  $('#ed-path').textContent = mode === 'add' ? path + '/…' : path;
+  $('#ed-key-row').hidden = mode !== 'add';
+  $('#ed-key').value = '';
+  $('#ed-type').value = 'string';
+  // Seed with what is there, so an edit starts from the truth rather than from an empty box.
+  const cur = mode === 'add' ? '' : mirror.value(path);
+  $('#ed-value').value = mode === 'add' ? ''
+    : typeof cur === 'string' ? cur
+    : cur === null || cur === undefined ? '' : JSON.stringify(cur);
+  if (mode !== 'add' && cur !== null && typeof cur === 'object') $('#ed-type').value = 'json';
+  else if (typeof cur === 'number') $('#ed-type').value = 'number';
+  else if (typeof cur === 'boolean') $('#ed-type').value = 'boolean';
+  edMsg('');
+  $('#edit').hidden = false;
+  ($('#ed-key-row').hidden ? $('#ed-value') : $('#ed-key')).focus();
+}
+
+const closeEditor = () => { $('#edit').hidden = true; editTarget = null; };
+$('#ed-cancel').addEventListener('click', closeEditor);
+$('#edit').addEventListener('click', (e) => { if (e.target === $('#edit')) closeEditor(); });
+
+$('#ed-save').addEventListener('click', () => {
+  if (!editTarget) return;
+  const parsed = parseTypedValue($('#ed-type').value, $('#ed-value').value);
+  if (!parsed.ok) return edMsg(parsed.msg, false);
+
+  let path = editTarget.path;
+  if (editTarget.mode === 'add') {
+    const key = $('#ed-key').value.trim();
+    if (!key) return edMsg('a key is required', false);
+    // §1's path rules, enforced here so the mistake is caught before the round trip. The server
+    // enforces them too, and its answer is the one that counts.
+    if (/[/.#$\[\]]/.test(key) || /[\u0000-\u001f\u007f]/.test(key)) {
+      return edMsg('a key may not contain / . # $ [ ] or control characters (§1)', false);
+    }
+    path = path === '' ? key : path + '/' + key;
+  }
+  $('#ed-save').disabled = true;
+  edMsg('saving…', true);
+  writeNode(path, parsed.value, (outcome) => {
+    $('#ed-save').disabled = false;
+    edMsg(outcome.text, outcome.ok);
+    // A refusal STAYS on screen next to what was refused; only a success closes the dialog.
+    if (outcome.ok) setTimeout(closeEditor, 550);
+  });
+});
+$('#ed-value').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#ed-save').click();
+  if (e.key === 'Escape') closeEditor();
+});
+
+function deleteNode(path, branch) {
+  // §7: a delete is a put of null, and what it leaves behind is a rev-stamped TOMBSTONE kept for the
+  // oplog retention — not a hole. Say so at the moment of destruction, where it is actually useful.
+  const what = branch ? 'this node AND EVERYTHING UNDER IT' : 'this value';
+  if (!confirm(`Delete ${what}?\n\n${path}\n\nThis writes null (§4). A delete leaves a rev-stamped `
+    + `tombstone kept for the oplog retention, not a hole — it is a write like any other, and it `
+    + `propagates to every client watching.`)) return;
+  writeNode(path, null, (outcome) => { showErr(outcome.ok ? '' : outcome.text); });
+}
+
+// ---------------------------------------------------------------------------- theme
+// Light is the default; the choice is remembered per browser. localStorage throws on a file://
+// opaque origin in some browsers, so every access is guarded — a console that will not render
+// because it could not remember a colour would be a poor trade.
+const themeBtn = $('#theme');
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  themeBtn.textContent = t === 'dark' ? 'light' : 'dark';   // the label is the destination
+  try { localStorage.setItem('rtdb-console-theme', t); } catch {}
+}
+let storedTheme = null;
+try { storedTheme = localStorage.getItem('rtdb-console-theme'); } catch {}
+applyTheme(storedTheme === 'dark' ? 'dark' : 'light');
+themeBtn.addEventListener('click', () =>
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+
+// ---------------------------------------------------------------------------- stats strip
+/*
+ * The numbers come from the ops box's own Prometheus, by way of GET /stats. Prometheus already
+ * scrapes the gateways every 15 seconds; reading ITS answer means this strip costs the gateways
+ * nothing at all -- no new endpoint, no extra scrape, not one additional connection to a gateway.
+ * That is by construction, not by budget.
+ *
+ * Polling matches the 15s scrape interval, because asking faster than the data changes only burns
+ * requests. A hidden tab polls not at all.
+ */
+const STATS_MS = 15_000;
+let statsTimer = null;
+
+const fmtNum = (n) => n >= 1000 ? n.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                 : n >= 10   ? n.toFixed(0)
+                 : Number.isInteger(n) ? String(n) : n.toFixed(1);
+
+async function pollStats() {
+  if (!SERVED || !authToken) return;
+  try {
+    const r = await fetch('/stats', { headers: { authorization: `Bearer ${authToken}` } });
+    if (!r.ok) {
+      // 401 means the hour is up. setState drives the sign-in overlay; just stop polling.
+      if (r.status === 401) stopStats();
+      return;
+    }
+    const d = await r.json();
+    const total = d.connectionsTotal?.[0]?.value ?? 0;
+    $('#st-conns').textContent = fmtNum(total);
+    $('#st-gws').textContent = '';
+    for (const g of d.connections ?? []) {
+      // Name and number in separate elements: run together as one string they read as
+      // "rtdb-gw-1 10rtdb-gw-2 15", which is unparseable at a glance.
+      const el = document.createElement('span');
+      const name = document.createElement('i');
+      name.textContent = (g.instance ?? '?').replace(/^rtdb-/, '');
+      const num = document.createElement('b');
+      num.textContent = fmtNum(g.value);
+      el.append(name, num);
+      if (g.az) el.title = `${g.instance} — ${g.az}`;
+      $('#st-gws').appendChild(el);
+    }
+    $('#st-writes').textContent = fmtNum(d.writesPerSec?.[0]?.value ?? 0);
+    const lag = d.consumerLag?.[0]?.value ?? 0;
+    $('#st-lag').textContent = fmtNum(lag);
+    $('#st-lag').style.color = lag > 10_000 ? 'var(--warn)' : '';
+    $('#st-age').textContent = 'updated just now';
+    $('#st-age').classList.remove('stale');
+    $('#stats').hidden = false;
+  } catch {
+    // A failed poll is not worth a banner: mark the numbers as aging and try again next tick.
+    $('#st-age').textContent = 'metrics unreachable';
+    $('#st-age').classList.add('stale');
+  }
+}
+
+function startStats() {
+  if (!SERVED || statsTimer) return;
+  pollStats();
+  statsTimer = setInterval(pollStats, STATS_MS);
+}
+function stopStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+}
+
+// A tab nobody is looking at does not poll. Coming back refreshes immediately rather than waiting
+// out the remainder of an interval, so the first thing the operator sees is current.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopStats();
+  else if (authToken) startStats();
+});
+
+// A 4401 means the hour is up (or the token was revoked). Send the operator back to sign in rather
+// than leaving them looking at a dead page — §6 forbids retrying the same token, and this is the
+// only honest thing to do with it.
+const _setState = setState;
+setState = function (s) {
+  _setState(s);
+  if (s === 'auth failed' && SERVED) {
+    stopStats();
+    $('#stats').hidden = true;
+    // The token is dead; so is anything it authorised. Put the panel away rather than leaving a
+    // button that can only produce 401s.
+    myRole = ''; $('#users-btn').hidden = true; $('#users').hidden = true;
+    $('#mode-tag').textContent = 'read-only';
+    $('#edit').hidden = true;
+    $('#login').hidden = false;
+    $('#login-err').textContent = 'Session expired. Sign in again.';
+  }
+};
+</script>

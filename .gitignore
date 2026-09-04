@@ -1,0 +1,24 @@
+node_modules/
+*.log
+.DS_Store
+
+# Gradle builds and caches, and the machine-specific SDK path. Written generically because both
+# sdk-kotlin and sdk-android/demo are their own Gradle builds and each grows its own.
+**/build/
+**/.gradle/
+**/.kotlin/
+**/local.properties
+**/.idea/
+.idea/
+
+# Terraform state holds every value it was given — the database password and the JWT secret among
+# them — in cleartext. It is never committed. Keep it in a remote backend, or off this tree.
+deploy/.terraform/
+deploy/*.tfstate
+deploy/*.tfstate.*
+deploy/*.tfvars
+deploy/*.tfvars.json
+
+# Output from scripts/pg-hang-hunt.sh: worth keeping for a run that actually hung, never worth
+# committing.
+hang-hunt-*/

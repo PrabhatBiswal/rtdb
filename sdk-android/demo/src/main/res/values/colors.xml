@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The console's Gate B palette, ported. Layered surfaces rather than one flat black, and scalar
+     types coloured distinctly — a reader should be able to tell a string "42" from the number 42
+     without reading the quotes. -->
+<resources>
+    <color name="bg">#0E1116</color>
+    <color name="surface">#161B22</color>
+    <color name="surface_raised">#1C232C</color>
+    <color name="border">#2A3441</color>
+    <color name="text">#E6EDF3</color>
+    <color name="muted">#8B949E</color>
+
+    <color name="ok">#3FB950</color>
+    <color name="warn">#D29922</color>
+    <color name="bad">#F85149</color>
+
+    <color name="json_key">#7EE787</color>
+    <color name="json_string">#A5D6FF</color>
+    <color name="json_number">#F2CC60</color>
+    <color name="json_bool">#FF7B72</color>
+    <color name="json_null">#6E7781</color>
+    <color name="flash">#2D3F2E</color>
+</resources>

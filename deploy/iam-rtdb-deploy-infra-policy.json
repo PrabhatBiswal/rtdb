@@ -1,0 +1,302 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "elasticloadbalancing:Describe*",
+        "rds:Describe*",
+        "rds:ListTagsForResource",
+        "elasticache:Describe*",
+        "elasticache:ListTagsForResource",
+        "ecr:Describe*",
+        "ecr:List*",
+        "acm:Describe*",
+        "acm:List*",
+        "logs:Describe*",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics",
+        "ssm:DescribeParameters",
+        "ssm:DescribeInstanceInformation",
+        "ssm:DescribeSessions",
+        "ssm:DescribeInstanceProperties",
+        "ssm:GetConnectionStatus",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "TaggingApiIsGlobalAndCannotBeRegionPinned",
+      "Effect": "Allow",
+      "Action": [
+        "tag:GetResources",
+        "tag:GetTagKeys",
+        "tag:GetTagValues"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateNewThings",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateVolume",
+        "ec2:CreateTags",
+        "ec2:RequestSpotInstances",
+        "ec2:CreateFleet",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "elasticloadbalancing:CreateTargetGroup",
+        "elasticloadbalancing:CreateListener",
+        "elasticloadbalancing:AddTags",
+        "rds:CreateDBInstance",
+        "rds:CreateDBSubnetGroup",
+        "rds:AddTagsToResource",
+        "elasticache:CreateCacheCluster",
+        "elasticache:CreateCacheSubnetGroup",
+        "elasticache:AddTagsToResource",
+        "acm:RequestCertificate",
+        "acm:AddTagsToCertificate"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "MutateOnlyProjectRtdb",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:DeleteSecurityGroup",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyInstanceMetadataOptions",
+        "ec2:DeleteVolume",
+        "ec2:AttachVolume",
+        "ec2:DetachVolume",
+        "ec2:DeleteTags",
+        "ec2:DeleteFleets",
+        "elasticloadbalancing:Delete*",
+        "elasticloadbalancing:Modify*",
+        "elasticloadbalancing:RegisterTargets",
+        "elasticloadbalancing:DeregisterTargets",
+        "elasticloadbalancing:SetSecurityGroups",
+        "elasticloadbalancing:SetSubnets",
+        "elasticloadbalancing:RemoveTags",
+        "acm:DeleteCertificate",
+        "acm:RemoveTagsFromCertificate",
+        "acm:UpdateCertificateOptions"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1",
+          "aws:ResourceTag/Project": "rtdb"
+        }
+      }
+    },
+    {
+      "Sid": "SpotRequestsCarryNoTagOfOurs",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CancelSpotInstanceRequests"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "SecurityGroupRulesOnlyOnOurGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:ModifySecurityGroupRules"
+      ],
+      "Resource": "arn:aws:ec2:ap-south-1:<ACCOUNT_ID>:security-group/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Project": "rtdb"
+        }
+      }
+    },
+    {
+      "Sid": "SecurityGroupRuleObjectsCannotCarryATagAtCreation",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:ModifySecurityGroupRules"
+      ],
+      "Resource": "arn:aws:ec2:ap-south-1:<ACCOUNT_ID>:security-group-rule/*"
+    },
+    {
+      "Sid": "SessionManagerIntoOurInstancesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartSession",
+        "ssm:SendCommand"
+      ],
+      "Resource": [
+        "arn:aws:ec2:ap-south-1:<ACCOUNT_ID>:instance/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1",
+          "aws:ResourceTag/Project": "rtdb"
+        }
+      }
+    },
+    {
+      "Sid": "SessionManagerDocumentsAndSessions",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartSession",
+        "ssm:TerminateSession",
+        "ssm:ResumeSession",
+        "ssm:SendCommand"
+      ],
+      "Resource": [
+        "arn:aws:ssm:ap-south-1::document/*",
+        "arn:aws:ssm:ap-south-1:<ACCOUNT_ID>:document/*",
+        "arn:aws:ssm:ap-south-1:<ACCOUNT_ID>:session/*"
+      ]
+    },
+    {
+      "Sid": "RdsRtdbNamesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "rds:Delete*",
+        "rds:Modify*",
+        "rds:Restore*",
+        "rds:Reboot*",
+        "rds:RemoveTagsFromResource",
+        "rds:CreateDBSnapshot",
+        "rds:StartDBInstance",
+        "rds:StopDBInstance"
+      ],
+      "Resource": [
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:db:rtdb*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:subgrp:rtdb*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:snapshot:rtdb*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:snapshot:rds:rtdb*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:pg:rtdb*"
+      ]
+    },
+    {
+      "Sid": "RdsMayREFERENCEDefaultParameterAndOptionGroups",
+      "Effect": "Allow",
+      "Action": [
+        "rds:RestoreDBInstanceToPointInTime",
+        "rds:CreateDBInstance"
+      ],
+      "Resource": [
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:pg:*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:og:*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:subgrp:rtdb*",
+        "arn:aws:rds:ap-south-1:<ACCOUNT_ID>:db:rtdb*"
+      ]
+    },
+    {
+      "Sid": "ElastiCacheRtdbNamesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:Delete*",
+        "elasticache:Modify*",
+        "elasticache:Reboot*",
+        "elasticache:RemoveTagsFromResource"
+      ],
+      "Resource": [
+        "arn:aws:elasticache:ap-south-1:<ACCOUNT_ID>:cluster:rtdb*",
+        "arn:aws:elasticache:ap-south-1:<ACCOUNT_ID>:subnetgroup:rtdb*"
+      ]
+    },
+    {
+      "Sid": "EcrRtdbReposOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:CreateRepository",
+        "ecr:DeleteRepository",
+        "ecr:PutLifecyclePolicy",
+        "ecr:GetLifecyclePolicy",
+        "ecr:DeleteLifecyclePolicy",
+        "ecr:PutImageScanningConfiguration",
+        "ecr:PutImageTagMutability",
+        "ecr:TagResource",
+        "ecr:UntagResource",
+        "ecr:ListTagsForResource",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:BatchDeleteImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:ap-south-1:<ACCOUNT_ID>:repository/rtdb-*"
+    },
+    {
+      "Sid": "EcrLoginTakesNothingNarrower",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "RtdbParametersOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:AddTagsToResource",
+        "ssm:RemoveTagsFromResource",
+        "ssm:ListTagsForResource",
+        "ssm:GetParameterHistory"
+      ],
+      "Resource": "arn:aws:ssm:ap-south-1:<ACCOUNT_ID>:parameter/rtdb/*"
+    },
+    {
+      "Sid": "SsmSecureStringKms",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.ap-south-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

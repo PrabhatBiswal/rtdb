@@ -1,0 +1,10 @@
+# The load rig as an image: the gateway image plus the two directories loadsim actually needs
+# (its dependency closure is src/ + harness/ + scripts/, no test tree). Shipping it this way means
+# the client instances need no Node install, no repo checkout and no build — they pull from ECR
+# exactly as the gateways do.
+ARG GATEWAY_IMAGE
+FROM ${GATEWAY_IMAGE}
+COPY harness ./harness
+COPY scripts ./scripts
+# Overridden per run: --conns, --rate, --seconds, --hot/--hotwrite/--cas, --gateways.
+ENTRYPOINT ["node", "--import", "tsx", "scripts/loadsim.ts"]

@@ -1,0 +1,94 @@
+# The production shape, runnable on a laptop (WORKLOAD §6 Gate A): two gateways behind one shard,
+# a real Postgres, a real Redis, and the monitoring pair that lives on its own box in AWS.
+#
+#   docker compose -f deploy/compose.prod.yml up --build -d
+#   node --import tsx harness/... / scripts/loadsim.ts --gateways ws://127.0.0.1:8081,ws://127.0.0.1:8082 ...
+#
+# In AWS this file splits in three: the gateway service runs on each EC2 gateway (against RDS and
+# ElastiCache), and prometheus+grafana run on the ops box. postgres and redis here are the LOCAL
+# REHEARSAL ONLY — WORKLOAD §3 allows them for exactly this.
+name: rtdb
+
+x-gateway: &gateway
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: rtdb-gateway:local
+  environment: &gateway-env
+    RTDB_PORT: 8080
+    RTDB_ADMIN_PORT: 9090
+    RTDB_STORAGE: postgres
+    RTDB_PG_URL: postgres://rtdb:rtdb@postgres:5432/rtdb
+    RTDB_REDIS_URL: redis://redis:6379
+    RTDB_SHARD: 0
+    # Deploy-review numbers (WORKLOAD §2) — PROPOSED here, ruled at Gate C. Reasoning in the report.
+    RTDB_PRUNE_MS: 300000
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  # Teeth: this probe hits the real /healthz, which reaches storage on every call. Stop Postgres and
+  # the container goes unhealthy — a health check that cannot fail is not a health check (§5).
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9090/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: rtdb
+      POSTGRES_PASSWORD: rtdb
+      POSTGRES_DB: rtdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rtdb -d rtdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["5433:5432"]        # 5433 on the host: the dev box already runs a 16 on 5432
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["6380:6379"]        # 6380: scripts/kick.ts from the host, without colliding with brew
+
+  gw1:
+    <<: *gateway
+    ports: ["8081:8080", "9101:9090"]
+  gw2:
+    <<: *gateway
+    ports: ["8082:8080", "9102:9090"]
+
+  prometheus:
+    build: ./prometheus
+    image: rtdb-prometheus:local
+    volumes: [promdata:/prometheus]
+    ports: ["9090:9090"]
+    depends_on: [gw1, gw2]
+
+  grafana:
+    build: ./grafana
+    image: rtdb-grafana:local
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Off unless a run asks for it. `GRAFANA_ANONYMOUS=true docker compose ... up -d grafana` is
+      # how the Gate A panel screenshot is taken headlessly; the ops box never sets it.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-false}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes: [grafanadata:/var/lib/grafana]
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:

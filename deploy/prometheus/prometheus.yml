@@ -1,0 +1,19 @@
+# One shard, two gateways, one scrape job. In AWS the targets become the gateways' private IPs;
+# nothing else about this file changes (WORKLOAD §2 — the ops box is the only scraper).
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: rtdb-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['gw1:9090', 'gw2:9090']
+    relabel_configs:
+      # `instance` is the label every dashboard panel splits by; the host:port is the honest value.
+      - source_labels: [__address__]
+        target_label: instance
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

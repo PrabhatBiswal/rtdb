@@ -1,0 +1,32 @@
+{
+  "name": "rtdb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-timeout=20000 test/*/*.test.ts",
+    "test:pg": "RTDB_STORAGE=postgres node --import tsx --test --test-timeout=30000 test/pg/*.pgtest.ts test/integration/*.test.ts",
+    "test:bus": "node --import tsx --test --test-timeout=40000 test/bus/*.bustest.ts && npm run test:redis",
+    "test:redis": "RTDB_TEST_REDIS=1 node --import tsx --test --test-timeout=40000 test/integration/*.test.ts",
+    "chaos": "node --import tsx --test --test-timeout=60000 test/chaos/*.test.ts",
+    "chaos:pg": "RTDB_STORAGE=postgres node --import tsx --test --test-timeout=60000 test/chaos/*.test.ts",
+    "chaos:cluster": "RTDB_CHAOS_CLUSTER=1 node --import tsx --test --test-timeout=90000 test/chaos/*.test.ts && node --import tsx --test --test-timeout=120000 test/chaos/*.clustertest.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "pg": "^8.23.0",
+    "prom-client": "^15.1.3",
+    "redis": "^5.12.1",
+    "tsx": "^4.19.2",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.52.0"
+  }
+}

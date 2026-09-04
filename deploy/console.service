@@ -1,0 +1,33 @@
+[Unit]
+Description=rtdb console sign-in service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rtdb-console
+Group=rtdb-console
+WorkingDirectory=/opt/rtdb-console
+ExecStart=/usr/bin/node /opt/rtdb-console/auth-server.mjs
+Environment=PORT=8080
+Environment=AWS_REGION=ap-south-1
+Environment=CONSOLE_WSS=wss://rtdb.example.com
+Restart=always
+RestartSec=3
+
+# It reads two SSM parameters and serves one file. Nothing else on this box is its business.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/rtdb-console
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

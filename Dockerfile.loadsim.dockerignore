@@ -1,0 +1,9 @@
+node_modules
+sdk-android
+sdk-kotlin
+test
+docs
+deploy
+.git
+.github
+*.md
