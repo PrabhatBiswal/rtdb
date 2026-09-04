@@ -21,7 +21,7 @@
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -54,10 +54,31 @@ if (wantedRole !== undefined && !ROLES.includes(wantedRole as Role)) {
 
 type Record_ = { salt: string; hash: string; params: typeof PARAMS; role?: Role };
 
-const ssmGet = (name: string): string =>
-  execFileSync('aws', ['ssm', 'get-parameter', '--name', name, '--with-decryption',
+/**
+ * Self-hosting without AWS: with CONSOLE_STORE_DIR set, the store is a file in that directory,
+ * exactly as the auth server reads it under the same variable. Unset, every path here is what it
+ * was — SSM read, SSM write. This is the only way to create the FIRST owner on a local install,
+ * since the console's own Users panel needs an owner who can already sign in.
+ */
+const STORE_DIR = process.env['CONSOLE_STORE_DIR'];
+const localFile = (name: string): string =>
+  join(STORE_DIR as string, name.replace(/^\//, '').replace(/\//g, '_') + '.json');
+
+const ssmGet = (name: string): string => {
+  if (STORE_DIR) {
+    // The caller distinguishes an absent store from a failed read and falls back only on the
+    // former, so a missing file has to look like SSM's absence rather than like a broken read.
+    try {
+      return readFileSync(localFile(name), 'utf8').trim();
+    } catch (e: unknown) {
+      if ((e as { code?: string }).code !== 'ENOENT') throw e;
+      throw new Error(`ParameterNotFound: ${name}`);
+    }
+  }
+  return execFileSync('aws', ['ssm', 'get-parameter', '--name', name, '--with-decryption',
     '--query', 'Parameter.Value', '--output', 'text', '--profile', profile, '--region', region],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+};
 
 /**
  * The store as it stands. A missing user store falls back to the legacy single-admin record (that
@@ -188,10 +209,15 @@ if (!Object.values(store).some((u) => (u.role ?? 'owner') === 'owner')) {
 const dir = mkdtempSync(join(tmpdir(), 'rtdb-users-'));
 const file = join(dir, 'users.json');
 try {
-  writeFileSync(file, JSON.stringify(store), { mode: 0o600 });
-  execFileSync('aws', ['ssm', 'put-parameter', '--name', param, '--type', 'SecureString',
-    '--overwrite', '--value', `file://${file}`, '--profile', profile, '--region', region],
-    { stdio: ['ignore', 'ignore', 'pipe'] });
+  if (STORE_DIR) {
+    // 0600, because this file holds every user's salt and password hash.
+    writeFileSync(localFile(param), JSON.stringify(store), { mode: 0o600 });
+  } else {
+    writeFileSync(file, JSON.stringify(store), { mode: 0o600 });
+    execFileSync('aws', ['ssm', 'put-parameter', '--name', param, '--type', 'SecureString',
+      '--overwrite', '--value', `file://${file}`, '--profile', profile, '--region', region],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  }
 } catch (e) {
   console.error(`could not write ${param} with profile "${profile}" in ${region}:`);
   console.error(String((e as { stderr?: Buffer }).stderr ?? e).trim().split('\n').slice(-2).join('\n'));

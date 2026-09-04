@@ -138,7 +138,7 @@ STAGE="$(mktemp -d /opt/rtdb/console-stage.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 
 # Never started, so nothing in the image executes and IMDS never enters the container. See
-# tools/console/Dockerfile.
+# console/Dockerfile.
 # `2>/dev/null` here was a mistake worth naming: the first version of this line swallowed docker's
 # own message, and the message WAS the diagnosis — an image with no CMD fails `create` with "no
 # command specified", which has nothing to do with whether the tag is pushed. A guard that hides the

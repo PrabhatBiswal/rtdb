@@ -26,8 +26,9 @@ infrastructure, and the tests that hold it together.
 | **`src/`** | The gateway. Protocol types and validation, the write pipeline (group commit, compare-and-swap, idempotent replay), two storage backends, and the cross-gateway fanout. |
 | **`sdk-kotlin/`** | A plain-JVM client: connection state machine, subscriptions, the two-layer mirror, and a Firebase-shaped surface. No Android dependency. |
 | **`sdk-android/`** | Android bindings — main-thread callbacks, background ping cadence, reconnect driven by `ConnectivityManager` — plus **a working demo app**. |
-| **`tools/console/`** | **A web admin console.** Sign in, browse and edit the live tree, manage users with owner/editor/viewer roles, reset passwords, read the audit log. Served by a small auth server that mints short-lived tokens. |
+| **`console/`** | **A web admin console.** Sign in, browse and edit the live tree, manage users with owner/editor/viewer roles, reset passwords, read the audit log. Served by a small auth server that mints short-lived tokens. |
 | **`deploy/`** | Terraform for the whole footprint: gateways behind a network load balancer, Postgres, Redis, container registries, and a Prometheus + Grafana host with dashboards. |
+| **`PROTOCOL.md`** | The wire protocol, frozen at v1.5 — frames, the reconnect contract, and the semantics every SDK must implement. Enough to write your own client against. |
 | **`test/`, `harness/`** | 230 tests, including **a chaos suite that kills the server during live traffic** (below). |
 | **`scripts/`** | Operator tools: a load rig that drives thousands of connections from forked workers, token minting, a Postgres wait-event sampler, and a harness that measures the commit cycle under fanout load. |
 
@@ -216,6 +217,48 @@ The gateway **refuses to start** with `RTDB_STORAGE=postgres` unless `RTDB_DEV_S
 default secret is a literal in this repository's source, so a real deployment that fell back to it
 would accept a forged token for any user. With in-memory storage the same situation is a loud
 warning instead of a refusal, so trying the project out stays a one-liner.
+
+---
+
+## Running the console
+
+The console is a single HTML page plus a small auth server. It signs in against a user store, mints
+short-lived tokens, and talks to the gateway over the same protocol any client uses — it has no
+privileged back channel.
+
+By default the store is an AWS SSM parameter, which is right for the deployment in `deploy/` and
+wrong for everyone else. Set `CONSOLE_STORE_DIR` and it becomes a file in that directory instead,
+with no AWS involved at all.
+
+```bash
+# 1. the gateway, with a secret of your own
+export RTDB_DEV_SECRET="$(openssl rand -hex 32)"
+RTDB_PORT=8080 node --import tsx src/gateway/main.ts
+
+# 2. the first owner. Interactive by design: the password is typed at a prompt with echo off, and
+#    never becomes an argument, an env var or a line in your shell history.
+export CONSOLE_STORE_DIR="$PWD/.console-store"
+node --import tsx scripts/console-admin-set.ts --email you@example.com --role owner
+
+# 3. the console, on the same secret as the gateway
+CONSOLE_WSS=ws://127.0.0.1:8080 PORT=8788 node console/auth-server.mjs
+```
+
+Open `http://127.0.0.1:8788`, sign in, type a path and press Watch. Expanding a node subscribes to
+it and collapsing unsubscribes, so the console is subject to the same `SNAPSHOT_MAX` limit as any
+other client — the root is deliberately not listenable.
+
+**One secret, one source.** The console signs tokens the gateway has to verify, so both read
+`RTDB_DEV_SECRET`. Give them different values and every token is rejected.
+
+**Three roles.** `owner` manages users and writes; `editor` writes; `viewer` reads. Console subjects
+are prefixed (`console-…`, `console-rw-…`) so a rule can tell console traffic from app traffic, and
+app tokens are never affected by a console role change.
+
+**The namespaces sidebar needs Prometheus.** It discovers gateways through Prometheus' targets API
+and reads the node list from each gateway's admin port, so on a local run without Prometheus it
+reads `unavailable`. Everything else — sign-in, watching paths, editing, user management — works
+without it. Set `PROM_URL` if you have one.
 
 ---
 

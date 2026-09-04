@@ -22,7 +22,7 @@ import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { createHmac, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -110,6 +110,20 @@ async function credentialFor(password) {
  * protection, zero infrastructure change.
  */
 const SHADOW_PARAM = process.env.SHADOW_PARAM ?? '/rtdb/console/shadow_key';
+/** Named rather than repeated as a literal, so the local store below can special-case exactly it. */
+const JWT_PARAM = process.env.JWT_PARAM ?? '/rtdb/prod/jwt_secret';
+
+/**
+ * SELF-HOSTING WITHOUT AWS. Set CONSOLE_STORE_DIR and the user store becomes a file in that
+ * directory instead of an SSM parameter, and the signing secret comes from RTDB_DEV_SECRET — the
+ * same variable the gateway is given, which is the point: the console signs tokens the gateway must
+ * verify, so one secret, one source.
+ *
+ * Unset, every path below is byte-identical to what it was: SSM reads, SSM writes, nothing new. The
+ * AWS deployment is the reviewed path and this does not touch it.
+ */
+const STORE_DIR = process.env.CONSOLE_STORE_DIR;
+const localFile = (name) => join(STORE_DIR, name.replace(/^\//, '').replace(/\//g, '_') + '.json');
 /** §2.3: 24h. Longer than a console token because a device fetches one per app start, not per view. */
 const SHADOW_HOURS = Number(process.env.SHADOW_HOURS ?? 24);
 // The single origin the page is allowed to open a socket to. One value, one allowlist entry.
@@ -202,6 +216,28 @@ let cache = { users: null, secret: null, at: 0 };
 const TTL = 5 * 60 * 1000;   // re-read every 5 min so a rotated password takes effect without a restart
 
 async function ssm(name, decrypt = true) {
+  if (STORE_DIR) {
+    // The signing secret is not a stored document — it belongs to the gateway, and it arrives the
+    // same way the gateway gets it. Absent is a configuration error worth failing on loudly, since
+    // the alternative is signing with undefined and every token being rejected downstream.
+    if (name === JWT_PARAM) {
+      const secret = process.env.RTDB_DEV_SECRET;
+      if (!secret) throw new Error('CONSOLE_STORE_DIR is set, so RTDB_DEV_SECRET must be too — the'
+        + ' console signs tokens this gateway has to verify, so both need the same secret.');
+      return secret;
+    }
+    try {
+      return (await readFile(localFile(name), 'utf8')).trim();
+    } catch (e) {
+      // loadUsers() separates an ABSENT parameter from every other failure and falls back only on
+      // the former, matching SSM's own wording. A local miss must carry that same signature or the
+      // first-run fallback turns into a hard error instead.
+      if (e.code !== 'ENOENT') throw e;
+      const err = new Error(`ParameterNotFound: ${name}`);
+      err.stderr = 'ParameterNotFound';
+      throw err;
+    }
+  }
   const args = ['ssm', 'get-parameter', '--name', name, '--query', 'Parameter.Value',
                 '--output', 'text', '--region', REGION];
   if (decrypt) args.push('--with-decryption');
@@ -245,7 +281,7 @@ async function loadUsers() {
 
 async function credentials() {
   if (cache.users && Date.now() - cache.at < TTL) return cache;
-  const [users, secret] = await Promise.all([loadUsers(), ssm('/rtdb/prod/jwt_secret')]);
+  const [users, secret] = await Promise.all([loadUsers(), ssm(JWT_PARAM)]);
   cache = { users, secret, at: Date.now() };
   return cache;
 }
@@ -268,9 +304,14 @@ async function putUsers(users) {
       + ` advanced tier.`);
   }
   try {
-    await writeFile(file, body, { mode: 0o600 });
-    await execFileAsync('aws', ['ssm', 'put-parameter', '--name', USERS_PARAM, '--type', 'SecureString',
-      '--overwrite', '--value', 'file://' + file, '--region', REGION], { maxBuffer: 1 << 20 });
+    if (STORE_DIR) {
+      // 0600 for the same reason the temp file is: this holds password hashes and their salts.
+      await writeFile(localFile(USERS_PARAM), body, { mode: 0o600 });
+    } else {
+      await writeFile(file, body, { mode: 0o600 });
+      await execFileAsync('aws', ['ssm', 'put-parameter', '--name', USERS_PARAM, '--type', 'SecureString',
+        '--overwrite', '--value', 'file://' + file, '--region', REGION], { maxBuffer: 1 << 20 });
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -309,7 +350,7 @@ let shadowCache = { key: null, secret: null, at: 0 };
 
 async function shadowCredentials() {
   if (shadowCache.key && Date.now() - shadowCache.at < TTL) return shadowCache;
-  const [key, secret] = await Promise.all([ssm(SHADOW_PARAM), ssm('/rtdb/prod/jwt_secret')]);
+  const [key, secret] = await Promise.all([ssm(SHADOW_PARAM), ssm(JWT_PARAM)]);
   shadowCache = { key, secret, at: Date.now() };
   return shadowCache;
 }

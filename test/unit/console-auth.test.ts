@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url';
  * does not hold, because the migration-free fallback to the single-admin record hangs entirely on
  * telling that apart from a denial.
  */
-const SERVER = fileURLToPath(new URL('../../tools/console/auth-server.mjs', import.meta.url));
-const HTML = fileURLToPath(new URL('../../tools/console/rtdb-console.html', import.meta.url));
+const SERVER = fileURLToPath(new URL('../../console/auth-server.mjs', import.meta.url));
+const HTML = fileURLToPath(new URL('../../console/rtdb-console.html', import.meta.url));
 
 const SCRYPT = { N: 2 ** 15, r: 8, p: 1, keylen: 64 } as const;
 const MAXMEM = 64 * 1024 * 1024;

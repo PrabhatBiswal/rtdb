@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
  * the page offers. The guard is the gateway's, and it has its own tests over a real socket
  * (test/integration/console-write.test.ts). A viewer who bypasses everything here is refused there.
  */
-const HTML = fileURLToPath(new URL('../../tools/console/rtdb-console.html', import.meta.url));
+const HTML = fileURLToPath(new URL('../../console/rtdb-console.html', import.meta.url));
 
 interface Wire {
   outboundAllowed(type: string, role: string): boolean;

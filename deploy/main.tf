@@ -415,7 +415,7 @@ resource "aws_ecr_repository" "grafana" {
 
 # Gate D's load rig. A repository costs nothing until something is pushed to it.
 # §5.13: an ARTIFACT repository, not a service. The console is extracted from this image and run
-# natively; the container is never started. See tools/console/Dockerfile for why ECR and not
+# natively; the container is never started. See console/Dockerfile for why ECR and not
 # user_data (16 KB cap) or Parameter Store (4/8 KB cap) — the files are 124 KB.
 resource "aws_ecr_repository" "console" {
   name                 = "rtdb-console"

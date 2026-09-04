@@ -1,5 +1,5 @@
 /**
- * Mint a SHORT-LIVED token for tools/console/rtdb-console.html.
+ * Mint a SHORT-LIVED token for console/rtdb-console.html.
  *
  *   node --import tsx scripts/console-token.ts --name asha [--role owner] [--hours 1]
  *                                              [--profile rtdb-deploy]

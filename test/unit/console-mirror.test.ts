@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
  * EXTRACTED from the file and evaluated here instead — which means these tests exercise the exact
  * code the browser runs, not a copy of it that could drift away from it silently.
  */
-const HTML = fileURLToPath(new URL('../../tools/console/rtdb-console.html', import.meta.url));
+const HTML = fileURLToPath(new URL('../../console/rtdb-console.html', import.meta.url));
 
 function loadMirror(): {
   Mirror: new () => {

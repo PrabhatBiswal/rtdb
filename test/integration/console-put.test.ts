@@ -15,7 +15,7 @@ import { signDevToken } from '../../src/gateway/auth.ts';
  *
  * An editor's lands. A viewer's is refused by the GATEWAY with RULES, which is the half that matters.
  */
-const HTML = fileURLToPath(new URL('../../tools/console/rtdb-console.html', import.meta.url));
+const HTML = fileURLToPath(new URL('../../console/rtdb-console.html', import.meta.url));
 
 function consoleBuildPut(): (path: string, value: unknown) => Record<string, unknown> {
   const block = /<script id="rtdb-wire">([\s\S]*?)<\/script>/.exec(readFileSync(HTML, 'utf8'));
