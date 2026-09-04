@@ -22,3 +22,8 @@ deploy/*.tfvars.json
 # Output from scripts/pg-hang-hunt.sh: worth keeping for a run that actually hung, never worth
 # committing.
 hang-hunt-*/
+
+# The local console store (CONSOLE_STORE_DIR in the README) holds every console user's password
+# salt and scrypt hash. It is created inside the clone by the documented quickstart, so it is
+# ignored here rather than left to whoever runs it to notice.
+/.console-store/

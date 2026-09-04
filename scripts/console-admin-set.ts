@@ -21,7 +21,7 @@
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -210,7 +210,11 @@ const dir = mkdtempSync(join(tmpdir(), 'rtdb-users-'));
 const file = join(dir, 'users.json');
 try {
   if (STORE_DIR) {
-    // 0600, because this file holds every user's salt and password hash.
+    // 0700 on the directory and 0600 on the file: this holds every user's salt and password hash.
+    // SSM never needed a directory to exist, so nothing here used to create one — and the first
+    // person to point CONSOLE_STORE_DIR at a path that did not exist got ENOENT after typing their
+    // password twice.
+    mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
     writeFileSync(localFile(param), JSON.stringify(store), { mode: 0o600 });
   } else {
     writeFileSync(file, JSON.stringify(store), { mode: 0o600 });
@@ -219,7 +223,11 @@ try {
       { stdio: ['ignore', 'ignore', 'pipe'] });
   }
 } catch (e) {
-  console.error(`could not write ${param} with profile "${profile}" in ${region}:`);
+  // The AWS wording is wrong for the local store: naming a profile and a region for a failed file
+  // write sends the reader to check credentials for something credentials had no part in.
+  console.error(STORE_DIR
+    ? `could not write ${param} to the local store at ${STORE_DIR}:`
+    : `could not write ${param} with profile "${profile}" in ${region}:`);
   console.error(String((e as { stderr?: Buffer }).stderr ?? e).trim().split('\n').slice(-2).join('\n'));
   process.exit(1);
 } finally {

@@ -101,8 +101,14 @@ immediately and are reconciled (or replayed) when the connection comes back.
 Requires **Node 22+**.
 
 ```bash
+git clone https://github.com/PrabhatBiswal/rtdb.git
+cd rtdb
 npm ci
 ```
+
+**Every command below runs from the repository root.** The sources are executed directly through
+`tsx`, which is a local dependency — run one of them from somewhere else and Node reports
+`Cannot find package 'tsx'`, which reads like a missing install rather than a wrong directory.
 
 ### Locally, with no infrastructure at all
 

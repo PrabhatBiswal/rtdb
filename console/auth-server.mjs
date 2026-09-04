@@ -22,7 +22,7 @@ import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { createHmac, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -305,7 +305,10 @@ async function putUsers(users) {
   }
   try {
     if (STORE_DIR) {
-      // 0600 for the same reason the temp file is: this holds password hashes and their salts.
+      // 0700 on the directory, 0600 on the file: this holds password hashes and their salts. The
+      // directory is created because SSM never needed one, so the local path is the first thing
+      // here that can fail simply because a path does not exist yet.
+      await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
       await writeFile(localFile(USERS_PARAM), body, { mode: 0o600 });
     } else {
       await writeFile(file, body, { mode: 0o600 });

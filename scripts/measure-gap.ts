@@ -102,12 +102,42 @@ class GapStorage implements StorageAdapter {
 const pct = (xs: number[], p: number): number =>
   xs.length === 0 ? 0 : [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))]!;
 
+/**
+ * What `sleep(HOLD_MS)` ACTUALLY costs on this machine, on an idle loop, measured at boot.
+ *
+ * setTimeout takes integer milliseconds: setTimeout(7.74) and setTimeout(7) are the same timer,
+ * measured p50 7.947 for both here, min 6.128 — it discards the fraction and it can fire EARLY.
+ * So the 7.74ms this harness exists to reproduce is not a hold the timer can express, and every
+ * `measured hold - HOLD_MS` subtraction against the nominal constant is arithmetic on a figure
+ * that never occurred. A run reading hold p50 7.09 against a 7.74 nominal is not a timer firing
+ * early by 0.65ms; it is the nominal being fiction.
+ *
+ * Measuring it instead of asserting it is also the only portable answer: timer overhead is a
+ * property of this machine and this Node build, so the baseline has to come from the rig the run
+ * happens on. Excess loop-blocking is `hold - holdBaselineMs`, never `hold - HOLD_MS`.
+ */
+const measureHoldBaseline = async (n = 200): Promise<number> => {
+  const xs: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const t = performance.now();
+    await sleep(HOLD_MS);
+    xs.push(performance.now() - t);
+  }
+  return pct(xs, 0.5);
+};
+const holdBaselineMs = await measureHoldBaseline();
+
 const storage = new GapStorage(new MemoryStorage(DEFAULT_LIMITS));
+// Anchors the accounting window. Reset by SIGUSR2 with the counters, so `accounted` below is
+// against the window the driver actually measured, not since boot.
+let windowFrom = performance.now();
 const loop = monitorEventLoopDelay({ resolution: 1 });
 loop.enable();
 
 const gw = await startGateway({ port: PORT, storage, limits: DEFAULT_LIMITS });
-process.stdout.write(`gap-gw listening ${gw.port} hold=${HOLD_MS}ms\n`);
+process.stdout.write(
+  `gap-gw listening ${gw.port} hold=${HOLD_MS}ms (idle baseline ${holdBaselineMs.toFixed(3)}ms)\n`,
+);
 
 // A report on SIGUSR2 rather than on a timer: the driver decides when the window is over, so the
 // numbers cover exactly the load phase and not the ramp-up before it.
@@ -127,6 +157,10 @@ const report = (): void => {
   // dispatcher kicks off — omitting it overstated the ceiling and made saturated runs read idle.
   // Guarded: with no samples this is 1000/0 = Infinity, which JSON.stringify renders as `null` —
   // a report that looks like a measurement and is not one.
+  const sumGap = gaps.reduce((a, b) => a + b, 0);
+  const sumRun = runs.reduce((a, b) => a + b, 0);
+  const sumHold = holds.reduce((a, b) => a + b, 0);
+  const windowMs = performance.now() - windowFrom;
   const cycle = holdP50 + runP50 + gapP50;
   const ceilingPerSec = cycle > 0 ? 1000 / cycle : null;
   process.stdout.write(
@@ -140,6 +174,29 @@ const report = (): void => {
         p99: +pct(gaps, 0.99).toFixed(3),
         max: +pct(gaps, 1).toFixed(3), // spread on ~116k samples is a stack overflow, not a slow path
       },
+      // The accounting identity, and the reason it REPLACES achieved-vs-ceiling as the check that
+      // a window is worth reading. The three buckets TILE: gap_n = start_n - lastEnd_(n-1),
+      // run_n = heldFrom_n - start_n, hold_n = lastEnd_n - heldFrom_n, so summing them telescopes
+      // to lastEnd_last - lastEnd_first. There is no fourth place for wall time to hide between
+      // the first and last commit of a window, and `accountedPct` well under 100 means the window
+      // is mostly ramp or idle tail, NOT that time escaped the cycle.
+      // Percentiles cannot do this arithmetic: commits x p50-cycle understates a heavy tail badly
+      // (a 24-sample window here carried a 3330ms run max against a 2.3ms run p50), so the sums
+      // are what the accounting must be read from.
+      // The old check assumed a fixed batch size. meanBatch moved 18 -> 2202 across configs, so
+      // commits/s collapses while the system is maximally saturated and the ceiling rule would
+      // reject the most saturated window in the set.
+      windowMs: +windowMs.toFixed(1),
+      // Subtract THIS, not HOLD_MS, to get loop-blocking inside the hold window.
+      holdBaselineMs: +holdBaselineMs.toFixed(3),
+      holdExcessMs: +Math.max(0, holdP50 - holdBaselineMs).toFixed(3),
+      sumMs: {
+        gap: +sumGap.toFixed(1),
+        run: +sumRun.toFixed(1),
+        hold: +sumHold.toFixed(1),
+        total: +(sumGap + sumRun + sumHold).toFixed(1),
+      },
+      accountedPct: windowMs > 0 ? +(((sumGap + sumRun + sumHold) / windowMs) * 100).toFixed(1) : null,
       runMs: {
         p50: +runP50.toFixed(3),
         p99: +pct(runs, 0.99).toFixed(3),
@@ -170,6 +227,7 @@ process.on('SIGUSR2', () => {
   storage.samples.length = 0;
   storage.commits = 0;
   storage.writes = 0;
+  windowFrom = performance.now();
   loop.reset();
 });
 process.on('SIGTERM', () => {
