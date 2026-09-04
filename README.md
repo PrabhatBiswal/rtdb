@@ -16,6 +16,63 @@ compare-and-swap for contended values, and horizontal fanout across more than on
 
 ---
 
+## What's in here
+
+Everything below is in this repository — the server, both clients, the admin UI, the
+infrastructure, and the tests that hold it together.
+
+| | |
+|---|---|
+| **`src/`** | The gateway. Protocol types and validation, the write pipeline (group commit, compare-and-swap, idempotent replay), two storage backends, and the cross-gateway fanout. |
+| **`sdk-kotlin/`** | A plain-JVM client: connection state machine, subscriptions, the two-layer mirror, and a Firebase-shaped surface. No Android dependency. |
+| **`sdk-android/`** | Android bindings — main-thread callbacks, background ping cadence, reconnect driven by `ConnectivityManager` — plus **a working demo app**. |
+| **`tools/console/`** | **A web admin console.** Sign in, browse and edit the live tree, manage users with owner/editor/viewer roles, reset passwords, read the audit log. Served by a small auth server that mints short-lived tokens. |
+| **`deploy/`** | Terraform for the whole footprint: gateways behind a network load balancer, Postgres, Redis, container registries, and a Prometheus + Grafana host with dashboards. |
+| **`test/`, `harness/`** | 230 tests, including **a chaos suite that kills the server during live traffic** (below). |
+| **`scripts/`** | Operator tools: a load rig that drives thousands of connections from forked workers, token minting, a Postgres wait-event sampler, and a harness that measures the commit cycle under fanout load. |
+
+### The chaos suite is the part worth looking at
+
+Eleven scenarios, each one an argument the implementation has to survive rather than a unit
+assertion. Among them: an ack that dies *after* the commit, and the replay returning the original
+revision instead of writing twice; five clients racing one compare-and-swap, with exactly one ack
+and four rejections carrying the state that won; a slow consumer whose queue overflows, forcing the
+server to order a resync; a tombstone refusing to let a stale delta resurrect a deleted subtree; and
+`SIGKILL` on the gateway mid-traffic, after which clients must back off, reconnect, replay their
+pending writes and converge on the same tree.
+
+```bash
+npm run chaos
+```
+
+### Capacity is measured, not claimed
+
+The write path's ceiling is one Postgres row: a revision counter held under `FOR UPDATE` across the
+transaction. Sampling `pg_stat_activity` during a real stall put a backend blocked on that row in
+**96% of samples**, and `ρ = λ × S` over an independently counted lock rate gives a hold of
+**≥ 7.74 ms** — a ceiling near **129 lock acquisitions per second**, against a measured demand of
+124. Group writes amortise it (five writes per acquisition in that run); compare-and-swap commits
+alone and does not.
+
+Two consequences worth knowing before you scale anything: **adding gateways does not raise write
+throughput**, because they contend for the same row, and the database was never the constraint
+(26% CPU, sub-2ms write latency at that load). The lever that pays is statements per transaction.
+
+### Customising the SDK, and shipping your own
+
+Apache-2.0, so forking the SDK, renaming it and publishing it under your own coordinates is
+expressly allowed — patent grant included. Two things the build does not do for you yet:
+
+- **Publishing targets only your local Maven repository.** `publishToMavenLocal` works today;
+  releasing to Maven Central needs a `publishing.repositories` block and artifact signing, which
+  this repo deliberately does not carry.
+- **`sdk-kotlin` verifies that its sources jar contains nothing outside its own package.** If you
+  rename the package, relax that check or it will fail your build — which is the point of it.
+
+The client is not tied to this repository's deployment: it speaks the protocol to any `wss://` URL.
+
+---
+
 ## How it works
 
 ```
