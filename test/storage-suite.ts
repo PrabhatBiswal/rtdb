@@ -87,6 +87,40 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
     assert.deepEqual((await s.readSnapshot('p')).value, { score: 50, keep: true, stats: { wins: 3 } });
   });
 
+  /**
+   * The ordering hazard the postgres batch has to respect. `{"a/b": ..., "a": ...}` is a LEGAL merge
+   * — validate.ts allows deep relative keys — so a merge's child paths are NOT prefix-disjoint by
+   * construction. Applied in order, the later `a` put replaces the whole `a` subtree and `a/b` is
+   * gone; batched as one DELETE followed by one INSERT, `a/b` would survive. Both backends must
+   * agree, and memory.ts applies strictly in order, so it is the reference.
+   */
+  test(`${name}: a merge with prefix-related keys applies in key order, not as a set`, async () => {
+    const s = fresh();
+    await s.commitGroup([
+      { writeId: wid(), path: 'p', op: 'merge', value: { 'a/b': 1, a: { z: 2 } } },
+    ]);
+    assert.deepEqual((await s.readSnapshot('p')).value, { a: { z: 2 } }, 'the later `a` wins whole');
+
+    // ...and the other order, where the deep key lands second and survives alongside nothing else.
+    const t = fresh();
+    await t.commitGroup([
+      { writeId: wid(), path: 'p', op: 'merge', value: { a: { z: 2 }, 'a/b': 1 } },
+    ]);
+    assert.deepEqual((await t.readSnapshot('p')).value, { a: { z: 2, b: 1 } });
+  });
+
+  test(`${name}: a group writing prefix-related paths applies in arrival order`, async () => {
+    const s = fresh();
+    await s.commitGroup([put('a/b', 1), put('a', { z: 2 })]);
+    assert.deepEqual((await s.readSnapshot('a')).value, { z: 2 }, 'the later, wider put wins');
+  });
+
+  test(`${name}: a group writing disjoint paths is unaffected by batching`, async () => {
+    const s = fresh();
+    await s.commitGroup([put('a/x', 1), put('b/y', 2), put('c', 3)]);
+    assert.deepEqual((await s.readSnapshot('')).value, { a: { x: 1 }, b: { y: 2 }, c: 3 });
+  });
+
   test(`${name}: a duplicate writeId returns the ORIGINAL rev and commits nothing (§4 step 4)`, async () => {
     const s = fresh();
     const w = put('a', 1);

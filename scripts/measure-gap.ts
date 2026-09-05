@@ -103,29 +103,52 @@ const pct = (xs: number[], p: number): number =>
   xs.length === 0 ? 0 : [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * p))]!;
 
 /**
- * What `sleep(HOLD_MS)` ACTUALLY costs on this machine, on an idle loop, measured at boot.
+ * What `sleep(HOLD_MS)` ACTUALLY costs on this machine — measured at boot, TWICE, because it is not
+ * one number.
  *
- * setTimeout takes integer milliseconds: setTimeout(7.74) and setTimeout(7) are the same timer,
- * measured p50 7.947 for both here, min 6.128 — it discards the fraction and it can fire EARLY.
- * So the 7.74ms this harness exists to reproduce is not a hold the timer can express, and every
- * `measured hold - HOLD_MS` subtraction against the nominal constant is arithmetic on a figure
- * that never occurred. A run reading hold p50 7.09 against a 7.74 nominal is not a timer firing
- * early by 0.65ms; it is the nominal being fiction.
+ * Two separate reasons the nominal constant is not the floor:
  *
- * Measuring it instead of asserting it is also the only portable answer: timer overhead is a
- * property of this machine and this Node build, so the baseline has to come from the rig the run
- * happens on. Excess loop-blocking is `hold - holdBaselineMs`, never `hold - HOLD_MS`.
+ *  1. setTimeout takes INTEGER milliseconds. setTimeout(7.74), setTimeout(7) and setTimeout(7.99)
+ *     are the same call; setTimeout(8) is a different one. The fraction is discarded, so the 7.74ms
+ *     figure this harness exists to reproduce has never once been held — the rig holds 7. Every
+ *     `measured hold - HOLD_MS` subtraction is arithmetic against a value that did not occur.
+ *
+ *  2. The floor MOVES WITH LOAD, in the direction that matters. Idle, the loop sleeps in kqueue and
+ *     pays wake-up latency getting back to the timers phase; busy, it is already passing through
+ *     that phase and catches the deadline sooner. Measured here: idle 7.951ms, busy 7.075ms. So a
+ *     floor sampled at boot on an idle loop is sampled under the one condition that never holds
+ *     during a run, and subtracting it yields NEGATIVE loop-blocking (7.09 - 7.94 = -0.85ms at
+ *     500 conns). That is the same error as the nominal, one layer down: a constant standing in for
+ *     something that varies with exactly the load under study.
+ *
+ * So: a bracket, not a constant. Excess is measured against the BUSY floor, which is the condition
+ * a loaded run is actually in, and the idle floor is reported next to it so the load-dependence
+ * stays visible instead of being buried in one more number.
+ *
+ * The spin below is the one place a busy-wait is correct in this file: it runs at BOOT, before the
+ * gateway accepts a connection, so it cannot contend with the delivery work under study — which is
+ * why the hold itself is still a setTimeout and not a spin (see #timed).
  */
-const measureHoldBaseline = async (n = 200): Promise<number> => {
+const measureHoldFloor = async (churn: boolean, n = 200): Promise<number> => {
+  let spinning = churn;
+  const spin = (): void => {
+    if (!spinning) return;
+    const end = performance.now() + 0.4;
+    while (performance.now() < end);
+    setImmediate(spin);
+  };
+  if (churn) setImmediate(spin);
   const xs: number[] = [];
   for (let i = 0; i < n; i++) {
     const t = performance.now();
     await sleep(HOLD_MS);
     xs.push(performance.now() - t);
   }
+  spinning = false;
   return pct(xs, 0.5);
 };
-const holdBaselineMs = await measureHoldBaseline();
+const holdFloorIdleMs = await measureHoldFloor(false);
+const holdFloorBusyMs = await measureHoldFloor(true);
 
 const storage = new GapStorage(new MemoryStorage(DEFAULT_LIMITS));
 // Anchors the accounting window. Reset by SIGUSR2 with the counters, so `accounted` below is
@@ -136,7 +159,8 @@ loop.enable();
 
 const gw = await startGateway({ port: PORT, storage, limits: DEFAULT_LIMITS });
 process.stdout.write(
-  `gap-gw listening ${gw.port} hold=${HOLD_MS}ms (idle baseline ${holdBaselineMs.toFixed(3)}ms)\n`,
+  `gap-gw listening ${gw.port} hold=${HOLD_MS}ms ` +
+    `(floor idle ${holdFloorIdleMs.toFixed(3)}ms / busy ${holdFloorBusyMs.toFixed(3)}ms)\n`,
 );
 
 // A report on SIGUSR2 rather than on a timer: the driver decides when the window is over, so the
@@ -188,8 +212,10 @@ const report = (): void => {
       // reject the most saturated window in the set.
       windowMs: +windowMs.toFixed(1),
       // Subtract THIS, not HOLD_MS, to get loop-blocking inside the hold window.
-      holdBaselineMs: +holdBaselineMs.toFixed(3),
-      holdExcessMs: +Math.max(0, holdP50 - holdBaselineMs).toFixed(3),
+      // A bracket, not a constant — the floor moves with load. Excess is against the BUSY floor;
+      // the idle one is here so the spread stays visible rather than becoming another phantom.
+      holdFloorMs: { idle: +holdFloorIdleMs.toFixed(3), busy: +holdFloorBusyMs.toFixed(3) },
+      holdExcessMs: +(holdP50 - holdFloorBusyMs).toFixed(3),
       sumMs: {
         gap: +sumGap.toFixed(1),
         run: +sumRun.toFixed(1),

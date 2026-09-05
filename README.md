@@ -210,7 +210,15 @@ creating a policy that points somewhere else.
 ## Authentication
 
 Tokens are HS256 JWTs. The gateway verifies them with `RTDB_DEV_SECRET` and takes the `sub` claim
-as the user id; path-level rules are evaluated per subscription and per write.
+as the user id.
+
+**There is no rules language, and the default authorizes everything.** A rules function is called on
+every subscription and every write, but the one that ships is `allowAll`, and the gateway passes no
+other — so **any token this gateway accepts can read and write the entire tree**. If you are
+replacing Firebase, this is the half of it that is not here: authentication is enforced, and
+authorization is yours to write. `Rules` is a plain function in `src/pipeline/rules.ts`; pass your
+own through `startGateway({ rules })` and it is consulted per path with the subject and the
+operation. Treat a deployment without one as a database whose only door is the token.
 
 In production, mint tokens in your own backend or IdP with the same secret — the gateway only ever
 verifies, it never issues. For local work there is a helper:

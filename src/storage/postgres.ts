@@ -2,7 +2,7 @@ import { randomInt } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import pg from 'pg';
 import { DEFAULT_LIMITS, type Limits } from '../protocol/limits.ts';
-import { ancestorsInclusive, joinPath } from '../protocol/path.ts';
+import { ancestorsInclusive, isRelevant, joinPath } from '../protocol/path.ts';
 import type { Json } from '../protocol/frames.ts';
 import type {
   AckResult,
@@ -65,6 +65,34 @@ interface OplogRow {
  */
 export const likeDescendants = (path: string): string =>
   path === '' ? '%' : `${path.replace(/[\\%_]/g, '\\$&')}/%`;
+
+/** One subtree replacement resolved out of a write: what lands at `path`, under `rev`. */
+interface Target {
+  path: string;
+  leaves: Leaf[];
+  rev: number;
+}
+
+/**
+ * May these targets be applied as one batch? Only if none is at-or-under another — see
+ * `#applyTargets` for why that is the exact condition. `isRelevant` is §3's predicate and already
+ * means "one is at-or-under the other"; it is true for a path against itself, so a group that
+ * writes the same path twice correctly falls back to ordered application.
+ *
+ * ponytail: O(n^2), and n is a commit group (~5) or a merge's key count. A sort-and-scan is the
+ * upgrade if either ever gets large enough to matter.
+ */
+const prefixDisjoint = (paths: string[]): boolean => {
+  for (let i = 0; i < paths.length; i++) {
+    for (let j = i + 1; j < paths.length; j++) {
+      if (isRelevant(paths[i] as string, paths[j] as string)) return false;
+    }
+  }
+  return true;
+};
+
+/** The same escaping, matching the path and nothing else — lets one LIKE array carry both halves. */
+const likeExact = (path: string): string => path.replace(/[\\%_]/g, '\\$&');
 
 /** "`col` is at or under the path in $1" — reading a snapshot, and keeping `nodes` prefix-free. */
 const atOrUnder = (col: string): string => `(${col} = $1 OR ${col} LIKE $2 ESCAPE '\\')`;
@@ -273,6 +301,7 @@ export class PostgresStorage implements StorageAdapter {
 
       const entries: OplogRow[] = [];
       const acks: AckResult[] = [];
+      const targets: Target[] = [];
       for (const [i, w] of writes.entries()) {
         const id = w.writeId.toLowerCase();
         if (!isNew[i]) {
@@ -282,11 +311,14 @@ export class PostgresStorage implements StorageAdapter {
         }
         const rev = next++;
         inBatch.set(id, rev);
-        await this.#apply(c, w.path, w.op, w.value, rev);
+        // Resolved now, applied once below: the whole group's nodes work is two statements, not two
+        // per write, and it all happens inside the same counter lock either way.
+        targets.push(...this.#resolve(w.path, w.op, w.value, rev));
         entries.push({ rev, path: w.path, op: w.op, value: w.value, writeId: id });
         acks.push({ writeId: w.writeId, rev, duplicate: false });
       }
 
+      await this.#applyTargets(c, targets);
       await this.#writeOplog(c, entries);
       return acks;
     });
@@ -325,7 +357,7 @@ export class PostgresStorage implements StorageAdapter {
         'UPDATE rev_counter SET v = v + 1 WHERE shard = 0 RETURNING v',
       );
       const rev = Number((rows[0] as { v: string }).v);
-      await this.#apply(c, write.path, 'put', write.value, rev);
+      await this.#applyTargets(c, this.#resolve(write.path, 'put', write.value, rev));
       await this.#writeOplog(c, [{ rev, path: write.path, op: 'put', value: write.value, writeId: id }]);
       return { ok: true, rev, duplicate: false };
     });
@@ -428,37 +460,92 @@ export class PostgresStorage implements StorageAdapter {
     return new Map(rows.map((r) => [r.write_id, Number(r.rev)]));
   }
 
-  /** §4: a merge is a child put per key, all under ONE rev — that is what makes deep keys atomic. */
-  async #apply(c: pg.PoolClient, path: string, op: WriteOp, value: Json, rev: number): Promise<void> {
-    if (op === 'merge') {
-      for (const [key, child] of Object.entries(value as { [k: string]: Json })) {
-        await this.#put(c, joinPath(path, key), child, rev);
-      }
-      return;
-    }
-    await this.#put(c, path, value, rev);
+  /**
+   * One subtree replacement: the leaves that land at `path`, under `rev`. Resolving a write into
+   * these BEFORE touching the database is what lets a whole group go in two statements instead of
+   * two per write — see `#applyTargets`.
+   */
+  #resolve(path: string, op: WriteOp, value: Json, rev: number): Target[] {
+    const one = (at: string, v: Json): Target => {
+      const flat = flatten(at, v, this.#limits);
+      // Validation (§4 step 1) already rejected anything unflattenable; reaching here with an error
+      // would be a pipeline bug, and silently storing nothing would hide it.
+      if (!flat.ok) throw new Error(`storage received an unvalidated write at "${at}": ${flat.msg}`);
+      return { path: at, leaves: flat.leaves, rev };
+    };
+    // §4: a merge is a child put per key, all under ONE rev — that is what makes deep keys atomic.
+    return op === 'merge'
+      ? Object.entries(value as { [k: string]: Json }).map(([key, child]) => one(joinPath(path, key), child))
+      : [one(path, value)];
   }
 
-  /** Replace the subtree at `path`, keeping the leaf set prefix-free in BOTH directions. */
-  async #put(c: pg.PoolClient, path: string, value: Json, rev: number): Promise<void> {
-    const flat = flatten(path, value, this.#limits);
-    // Validation (§4 step 1) already rejected anything unflattenable; reaching here with an error
-    // would be a pipeline bug, and silently storing nothing would hide it.
-    if (!flat.ok) throw new Error(`storage received an unvalidated write at "${path}": ${flat.msg}`);
+  /**
+   * Every resolved write of one commit, in TWO statements rather than two per write.
+   *
+   * The old shape issued a DELETE and an INSERT per write, serially, inside the `rev_counter` lock.
+   * A 5-write group was 10 round trips; a 20-key merge is ONE write costing 40, because §4 expands
+   * it to a put per key. That multiplier is paid entirely inside the lock, so it is the hold, and
+   * the hold is the ceiling.
+   *
+   * Batching is only sound when no target can disturb another, and one fact gives that: two paths
+   * that are both prefixes of the same string are prefixes of one another. Everything this DELETE
+   * touches for target A — A's subtree, A's ancestors — is a path A is a prefix of or a prefix of A.
+   * So for it to reach anything of B's, A and B would have to be prefix-related, which the guard
+   * excludes. With that, all DELETEs may precede all INSERTs and per-write ordering stops mattering.
+   *
+   * When it does NOT hold, order is the answer and we pay the old cost for that group. Merges are
+   * the case worth naming: `{"a/b": 1, "a": {"z": 2}}` is a LEGAL merge — validate.ts allows deep
+   * relative keys — and applied in order it leaves only `p/a/z`, while batched it would leave
+   * `p/a/b` too. Merge keys are NOT disjoint by construction, so they take the same check as
+   * everything else.
+   */
+  async #applyTargets(c: pg.PoolClient, targets: Target[]): Promise<void> {
+    if (targets.length === 0) return;
+    if (targets.length > 1 && !prefixDisjoint(targets.map((t) => t.path))) {
+      for (const t of targets) await this.#applyTargets(c, [t]);
+      return;
+    }
 
-    // Everything at or under `path` goes, and so does any scalar sitting at an ancestor — writing
-    // `a/b/c` turns a scalar `a/b` into an object.
+    // Everything at or under each target goes, and so does any scalar sitting at an ancestor —
+    // writing `a/b/c` turns a scalar `a/b` into an object. Both halves ride one LIKE array so this
+    // stays a single statement, and both are exact-or-prefix predicates, so `nodes`' index still
+    // drives the scan the way it did per-write.
+    const exact: string[] = [];
+    const like: string[] = [];
+    for (const t of targets) {
+      exact.push(t.path);
+      like.push(likeDescendants(t.path));
+      for (const a of ancestorsInclusive(t.path)) {
+        if (a === t.path) continue;
+        exact.push(a);
+        like.push(likeExact(a));
+      }
+    }
     await c.query(
-      `DELETE FROM nodes WHERE ${atOrUnder('path')} OR path = ANY($3::text[])`,
-      [path, likeDescendants(path), ancestorsInclusive(path).filter((a) => a !== path)],
+      `DELETE FROM nodes n
+         USING unnest($1::text[], $2::text[]) AS t(p, pat)
+         WHERE n.path = t.p OR n.path LIKE t.pat ESCAPE '\\'`,
+      [exact, like],
     );
-    if (flat.leaves.length === 0) return; // null and {} store nothing (§1)
 
+    const paths: string[] = [];
+    const values: string[] = [];
+    const revs: number[] = [];
+    for (const t of targets) {
+      for (const l of t.leaves) {
+        paths.push(l.path);
+        values.push(JSON.stringify(l.value));
+        revs.push(t.rev);
+      }
+    }
+    if (paths.length === 0) return; // null and {} store nothing (§1)
+
+    // Per-row rev, not one bound value: a group carries a different rev per write.
     await c.query(
       `INSERT INTO nodes (path, value, rev)
-       SELECT p, v, $3 FROM unnest($1::text[], $2::jsonb[]) AS t(p, v)
+       SELECT p, v, r FROM unnest($1::text[], $2::jsonb[], $3::bigint[]) AS t(p, v, r)
            ON CONFLICT (path) DO UPDATE SET value = EXCLUDED.value, rev = EXCLUDED.rev`,
-      [flat.leaves.map((l) => l.path), flat.leaves.map((l) => JSON.stringify(l.value)), rev],
+      [paths, values, revs],
     );
   }
 

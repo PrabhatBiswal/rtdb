@@ -1,8 +1,9 @@
 /**
  * Mint a SHORT-LIVED token for console/rtdb-console.html.
  *
+ *   RTDB_DEV_SECRET=... node --import tsx scripts/console-token.ts --name asha   # local gateway
  *   node --import tsx scripts/console-token.ts --name asha [--role owner] [--hours 1]
- *                                              [--profile rtdb-deploy]
+ *                                              [--profile rtdb-deploy]            # the deployment
  *
  * The point is the habit, not the cryptography: without this, an operator opening the console
  * reaches for whatever token is nearest, and the nearest one is long-lived and production. This
@@ -14,8 +15,10 @@
  * /users check; a token minted without one is refused by all three, which is exactly what keeps a
  * device's shadow token from reading the fleet.
  *
- * The secret is read from SSM at run time and never written anywhere: not to a file, not to the
- * shell history, not into the console page. ONLY the token is printed, so `| pbcopy` is safe.
+ * The secret comes from RTDB_DEV_SECRET when it is set, and from SSM otherwise — so this works
+ * against a local gateway with no AWS at all, and against the deployment when you have the profile.
+ * Either way it is never written anywhere: not to a file, not to the shell history, not into the
+ * console page. ONLY the token is printed, so `| pbcopy` is safe.
  */
 import { execFileSync } from 'node:child_process';
 import { signDevToken } from '../src/gateway/auth.ts';
@@ -47,8 +50,22 @@ if (!['owner', 'editor', 'viewer'].includes(role)) {
 const profile = flag('profile') ?? 'rtdb-deploy';
 const region = process.env['AWS_REGION'] ?? 'ap-south-1';
 
+/**
+ * Self-hosting without AWS: RTDB_DEV_SECRET is the same variable the gateway is given, so a token
+ * minted here is one that gateway can verify. The console's auth server and console-admin-set.ts
+ * take the same fallback; this file was missed when they got it, and the README meanwhile offered
+ * this script as the local helper — so on any machine without the deploy profile the documented
+ * way to get a token could not work at all, and on a machine WITH it the result was worse: a token
+ * signed with the PRODUCTION secret, which a local gateway rejects with close 4401.
+ *
+ * The env var wins when it is set. That ordering matters: reaching for SSM first would make a
+ * developer with credentials silently mint production-signed tokens for a local server.
+ */
 let secret: string;
-try {
+const devSecret = process.env['RTDB_DEV_SECRET'];
+if (devSecret) {
+  secret = devSecret;
+} else try {
   secret = execFileSync(
     'aws',
     ['ssm', 'get-parameter', '--name', '/rtdb/prod/jwt_secret', '--with-decryption',
@@ -57,7 +74,7 @@ try {
   ).trim();
 } catch (e) {
   // Fail loud and specific: a missing profile and a denied parameter are different problems.
-  console.error(`could not read /rtdb/prod/jwt_secret with profile "${profile}" in ${region}:`);
+  console.error(`could not read /rtdb/prod/jwt_secret with profile "${profile}" in ${region} (set RTDB_DEV_SECRET to mint a token for a local gateway instead):`);
   console.error(String((e as { stderr?: Buffer }).stderr ?? e).trim().split('\n').slice(-2).join('\n'));
   process.exit(1);
 }

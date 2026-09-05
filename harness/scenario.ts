@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import type { Json } from '../src/protocol/frames.ts';
 import type { Limits } from '../src/protocol/limits.ts';
+import { devSecret } from '../src/gateway/auth.ts';
 import { RtdbClient } from './client.ts';
 import { dropSchema, isPostgres, PG_URL, uniqueSchema } from './pg.ts';
 
@@ -67,6 +68,12 @@ export class GatewayProcess {
         ...process.env,
         RTDB_PORT: String(port),
         RTDB_LIMITS: JSON.stringify(this.limits),
+        // main.ts REFUSES to boot on postgres without this (a real deployment must not verify
+        // tokens with the public default), and every spawn here is a real main.ts against a real
+        // database. Not a bypass of that guard: `devSecret()` resolves to the SAME value this
+        // process signs tokens with, so setting only the child's would make the child reject every
+        // token the parent mints. Whatever the suite runs under, both halves agree.
+        RTDB_DEV_SECRET: devSecret(),
         ...this.#storageEnv(),
         ...this.extraEnv,
       },
