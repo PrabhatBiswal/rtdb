@@ -121,6 +121,26 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
     assert.deepEqual((await s.readSnapshot('')).value, { a: { x: 1 }, b: { y: 2 }, c: 3 });
   });
 
+  test(`${name}: a put at ROOT replaces the whole tree`, async () => {
+    // Root is the one path the batched DELETE cannot express as a range — every path descends from
+    // it, so `[p || '/', p || '0')` says the opposite of what root means. Nothing in this suite
+    // wrote root before, only read it, so the branch that handles it had no tooth at all.
+    const s = fresh();
+    await s.commitGroup([put('a/x', 1), put('b', 2)]);
+    await s.commitGroup([put('', { c: 3 })]);
+    assert.deepEqual((await s.readSnapshot('')).value, { c: 3 }, 'a root put leaves nothing of the old tree');
+    assert.equal((await s.readSnapshot('a/x')).value, null);
+  });
+
+  test(`${name}: a scalar at root is replaced by a deeper write, and vice versa`, async () => {
+    // The ancestor half of the DELETE, at the one ancestor that is the empty string.
+    const s = fresh();
+    await s.commitGroup([put('', 7)]);
+    assert.equal((await s.readSnapshot('')).value, 7);
+    await s.commitGroup([put('a/b', 1)]);
+    assert.deepEqual((await s.readSnapshot('')).value, { a: { b: 1 } }, 'the root scalar must be gone');
+  });
+
   test(`${name}: a duplicate writeId returns the ORIGINAL rev and commits nothing (§4 step 4)`, async () => {
     const s = fresh();
     const w = put('a', 1);

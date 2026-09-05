@@ -377,6 +377,8 @@ export async function startGateway(opts: GatewayOptions = {}): Promise<Gateway> 
     leader: () => (bus === null || bus.isLeader ? 1 : 0),
     publishing: () => (bus === null || bus.publishing ? 1 : 0),
     lagRevs: async () => (bus === null ? 0 : (await storage.head()) - bus.deliveredRev),
+    // Only the Postgres adapter batches, so only it has these to report.
+    applyStats: () => ('applyStats' in storage ? storage.applyStats : undefined) ?? { groups: 0, orderedFallbacks: 0 },
   });
 
   const token = await new Promise<uWS.us_listen_socket>((resolve, reject) => {

@@ -102,5 +102,12 @@ export interface StorageAdapter {
    * in-memory adapter holds nothing; whoever CONSTRUCTED the storage calls it, since a gateway may
    * be handed a store it does not own (two gateways sharing one shard in the reconnect tests).
    */
+  /**
+   * How the nodes half of a commit was applied, cumulative — `groups` counts commits with more
+   * than one target, `orderedFallbacks` the ones that could not batch and paid the old per-write
+   * cost. Optional because only the Postgres adapter batches; `/metrics` reports it when present.
+   */
+  readonly applyStats?: { groups: number; orderedFallbacks: number };
+
   close?(): Promise<void>;
 }

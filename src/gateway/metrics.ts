@@ -115,6 +115,24 @@ export const consumerLag = new Gauge({
   },
 });
 
+export const applyGroups = new Counter({
+  name: 'rtdb_storage_apply_groups_total',
+  help: 'Commits whose nodes work had more than one target — the ones that COULD be applied as one batch.',
+  collect() {
+    this.reset();
+    this.inc(sources?.applyStats().groups ?? 0);
+  },
+});
+
+export const orderedFallbacks = new Counter({
+  name: 'rtdb_storage_ordered_fallbacks_total',
+  help: 'Commits that failed the prefix-disjointness guard and applied in order at the old per-write cost. Silent otherwise, and the cost is paid inside the rev_counter lock.',
+  collect() {
+    this.reset();
+    this.inc(sources?.applyStats().orderedFallbacks ?? 0);
+  },
+});
+
 // Process CPU, RSS, event-loop lag, handles. One line, and it is what tells a "the gateway is slow"
 // page apart from a "the database is slow" one.
 collectDefaultMetrics({ prefix: 'rtdb_proc_' });
@@ -127,6 +145,7 @@ export interface MetricSources {
   leader: () => 0 | 1;
   publishing: () => 0 | 1;
   lagRevs: () => Promise<number>;
+  applyStats: () => { groups: number; orderedFallbacks: number };
 }
 
 let sources: MetricSources | null = null;

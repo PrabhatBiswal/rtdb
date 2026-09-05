@@ -91,9 +91,6 @@ const prefixDisjoint = (paths: string[]): boolean => {
   return true;
 };
 
-/** The same escaping, matching the path and nothing else — lets one LIKE array carry both halves. */
-const likeExact = (path: string): string => path.replace(/[\\%_]/g, '\\$&');
-
 /** "`col` is at or under the path in $1" — reading a snapshot, and keeping `nodes` prefix-free. */
 const atOrUnder = (col: string): string => `(${col} = $1 OR ${col} LIKE $2 ESCAPE '\\')`;
 
@@ -102,6 +99,22 @@ const atOrUnder = (col: string): string => `(${col} = $1 OR ${col} LIKE $2 ESCAP
  * an ancestor of it ($2, the <=33 expanded ancestor paths). §8 gives one index for each half, and
  * `plans.pgtest.ts` EXPLAINs this exact string to keep it that way.
  */
+/**
+ * The nodes half of a write, as three shipped strings — exported for the same reason
+ * `RELEVANT_SQL` is: `plans.pgtest.ts` EXPLAINs THESE, not a copy that can drift from them.
+ *
+ * `$1` is every path to remove exactly (the targets and their ancestors); the descendant half is a
+ * RANGE over `text_pattern_ops`, never a LIKE. See `#deleteTargets` for why that distinction is the
+ * whole point, and `TOPNODES_SQL` for the byte-order argument the bounds rest on.
+ */
+export const DELETE_SOLO_SQL = `DELETE FROM nodes WHERE path = ANY($1::text[]) OR (path ~>=~ $2 AND path ~<~ $3)`;
+
+export const DELETE_EXACT_SQL = `DELETE FROM nodes WHERE path = ANY($1::text[])`;
+
+export const DELETE_RANGE_SQL = `DELETE FROM nodes n
+   USING unnest($1::text[], $2::text[]) AS t(lo, hi)
+   WHERE n.path ~>=~ t.lo AND n.path ~<~ t.hi`;
+
 export const RELEVANT_SQL = `(path = ANY($2::text[]) OR path LIKE $3 ESCAPE '\\')`;
 
 /**
@@ -179,6 +192,14 @@ export class PostgresStorage implements StorageAdapter {
   /** Resolves to the epoch; also the "schema is applied" latch. Every public method awaits it. */
   #ready: Promise<number> | null = null;
   readonly #listeners = new Set<() => void>();
+
+  /**
+   * §5.17: the ordered fallback used to be silent. A workload that collides on every commit —
+   * presence, a cursor, a counter, anything that writes ONE path repeatedly — would pay the old
+   * per-write cost forever with nothing anywhere to say so. `groups` is the denominator: commits
+   * whose nodes work had more than one target, i.e. the ones that COULD have batched.
+   */
+  readonly #applyStats = { groups: 0, orderedFallbacks: 0 };
   readonly #url: string;
   /**
    * The backend PIDs of our OWN pool connections. Our commits already woke the local listeners
@@ -237,6 +258,11 @@ export class PostgresStorage implements StorageAdapter {
   /** §2: the generation is read once at startup and never moves while the store lives. */
   epoch(): Promise<number> {
     return this.#init();
+  }
+
+  /** Cumulative since process start; see `#applyStats`. Read by the gateway's `/metrics`. */
+  get applyStats(): { groups: number; orderedFallbacks: number } {
+    return { ...this.#applyStats };
   }
 
   /** §5.6's sidebar. Skip scan over the path index — see TOPNODES_SQL for why, and why not counts. */
@@ -480,7 +506,7 @@ export class PostgresStorage implements StorageAdapter {
   }
 
   /**
-   * Every resolved write of one commit, in TWO statements rather than two per write.
+   * Every resolved write of one commit, in a CONSTANT number of statements rather than two per write.
    *
    * The old shape issued a DELETE and an INSERT per write, serially, inside the `rev_counter` lock.
    * A 5-write group was 10 round trips; a 20-key merge is ONE write costing 40, because §4 expands
@@ -493,40 +519,25 @@ export class PostgresStorage implements StorageAdapter {
    * So for it to reach anything of B's, A and B would have to be prefix-related, which the guard
    * excludes. With that, all DELETEs may precede all INSERTs and per-write ordering stops mattering.
    *
-   * When it does NOT hold, order is the answer and we pay the old cost for that group. Merges are
-   * the case worth naming: `{"a/b": 1, "a": {"z": 2}}` is a LEGAL merge — validate.ts allows deep
-   * relative keys — and applied in order it leaves only `p/a/z`, while batched it would leave
-   * `p/a/b` too. Merge keys are NOT disjoint by construction, so they take the same check as
-   * everything else.
+   * When it does NOT hold, order is the answer and we pay the old cost for that group — and
+   * `applyStats` counts it, because a workload that always collided would otherwise pay the old
+   * per-write cost forever with nothing to show it. Merges are the case worth naming:
+   * `{"a/b": 1, "a": {"z": 2}}` is a LEGAL merge — validate.ts allows deep relative keys — and
+   * applied in order it leaves only `p/a/z`, while batched it would leave `p/a/b` too. Merge keys
+   * are NOT disjoint by construction, so they take the same check as everything else.
    */
   async #applyTargets(c: pg.PoolClient, targets: Target[]): Promise<void> {
     if (targets.length === 0) return;
-    if (targets.length > 1 && !prefixDisjoint(targets.map((t) => t.path))) {
-      for (const t of targets) await this.#applyTargets(c, [t]);
-      return;
-    }
-
-    // Everything at or under each target goes, and so does any scalar sitting at an ancestor —
-    // writing `a/b/c` turns a scalar `a/b` into an object. Both halves ride one LIKE array so this
-    // stays a single statement, and both are exact-or-prefix predicates, so `nodes`' index still
-    // drives the scan the way it did per-write.
-    const exact: string[] = [];
-    const like: string[] = [];
-    for (const t of targets) {
-      exact.push(t.path);
-      like.push(likeDescendants(t.path));
-      for (const a of ancestorsInclusive(t.path)) {
-        if (a === t.path) continue;
-        exact.push(a);
-        like.push(likeExact(a));
+    if (targets.length > 1) {
+      this.#applyStats.groups++;
+      if (!prefixDisjoint(targets.map((t) => t.path))) {
+        this.#applyStats.orderedFallbacks++;
+        for (const t of targets) await this.#applyTargets(c, [t]);
+        return;
       }
     }
-    await c.query(
-      `DELETE FROM nodes n
-         USING unnest($1::text[], $2::text[]) AS t(p, pat)
-         WHERE n.path = t.p OR n.path LIKE t.pat ESCAPE '\\'`,
-      [exact, like],
-    );
+
+    await this.#deleteTargets(c, targets);
 
     const paths: string[] = [];
     const values: string[] = [];
@@ -547,6 +558,52 @@ export class PostgresStorage implements StorageAdapter {
            ON CONFLICT (path) DO UPDATE SET value = EXCLUDED.value, rev = EXCLUDED.rev`,
       [paths, values, revs],
     );
+  }
+
+  /**
+   * Everything at or under each target goes, and so does any scalar sitting at an ancestor —
+   * writing `a/b/c` turns a scalar `a/b` into an object.
+   *
+   * The descendant half is a RANGE, never a LIKE, and that is the whole point of this method.
+   * `n.path LIKE t.pat` with `t.pat` a COLUMN cannot use an index at ANY array size — a LIKE
+   * prefix becomes an index bound only when the pattern is known at plan time — so the first
+   * batched version of this turned the DELETE into a Nested Loop over a Seq Scan of `nodes`:
+   * measured 81 ms for a five-write group at 40k rows and 1.5 s at 400k, all of it inside the
+   * lock, and growing with the table. `~>=~`/`~<~` are the `text_pattern_ops` operators
+   * `nodes_path_pattern` is built for (`TOPNODES_SQL` already leans on them) and they need no
+   * escaping: `[p || '/', p || '0')` is EXACTLY p's descendants, because '/' is 0x2F and '0' is
+   * 0x30, so no legal path sorts between them. `plans.pgtest.ts` pins the plan.
+   */
+  async #deleteTargets(c: pg.PoolClient, targets: Target[]): Promise<void> {
+    const first = targets[0] as Target;
+    // A put at root replaces the whole tree, and root is the one path with no `[lo, hi)`: every
+    // path descends from it. It can only ever arrive alone — root is prefix-related to
+    // everything, so a group containing it never passes the guard above.
+    if (first.path === '') {
+      await c.query('DELETE FROM nodes');
+      return;
+    }
+
+    // `ancestorsInclusive` carries the target itself, and a group of siblings shares nearly all of
+    // its ancestors, so the set is not decoration: 2,202 depth-4 targets collapse from 11,010
+    // array entries to 7,107.
+    const exact = new Set<string>();
+    for (const t of targets) for (const a of ancestorsInclusive(t.path)) exact.add(a);
+
+    if (targets.length === 1) {
+      // One target needs no join, so both halves stay in ONE statement. This is the path the
+      // ordered fallback loops over, once per write inside the lock, and a second round trip there
+      // is exactly what it cannot afford.
+      await c.query(DELETE_SOLO_SQL, [[...exact], `${first.path}/`, `${first.path}0`]);
+      return;
+    }
+
+    // Two statements, because the halves cannot share one: an OR across a join condition is the
+    // shape that loses the index. The exact half joins nothing, so its worst case is ONE scan of
+    // `nodes` — the planner takes it over thousands of index probes and is right to; the
+    // descendant half stays index-driven at every size measured, and that is what the test pins.
+    await c.query(DELETE_EXACT_SQL, [[...exact]]);
+    await c.query(DELETE_RANGE_SQL, [targets.map((t) => `${t.path}/`), targets.map((t) => `${t.path}0`)]);
   }
 
   /** The oplog half of the same transaction, plus §9 retention and §8's cross-process poke. */

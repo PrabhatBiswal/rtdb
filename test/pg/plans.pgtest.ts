@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test, { after, type TestContext } from 'node:test';
 import { ancestorsInclusive } from '../../src/protocol/path.ts';
-import { likeDescendants, RELEVANT_SQL, TOPNODES_SQL } from '../../src/storage/postgres.ts';
+import {
+  DELETE_EXACT_SQL,
+  DELETE_RANGE_SQL,
+  DELETE_SOLO_SQL,
+  likeDescendants,
+  RELEVANT_SQL,
+  TOPNODES_SQL,
+} from '../../src/storage/postgres.ts';
 import { createDatabase } from './helper.ts';
 
 /**
@@ -141,6 +148,95 @@ test('§3 snapshot: the subtree read is index-served on nodes', async (t) => {
     ['MPK_1010/1474396', likeDescendants('MPK_1010/1474396')],
   );
   assertNoSeqScan(nodes, 'nodes', 'the snapshot read');
+});
+
+// ------------------------------------------------------- §5.17 the write path, INSIDE the lock
+
+// The group the sampler actually caught in production: 2,202 writes in one commit, depth-4 paths.
+// Everything below runs at that size as well as at the p50 group of five, because the first batched
+// version of this DELETE was index-served in neither and the report said it was served in both.
+const GROUP = (n: number): string[] => Array.from({ length: n }, (_, k) => `MPK_${k % 500}/${k % 977}`);
+const exactArray = (targets: string[]): string[] => [
+  ...new Set(targets.flatMap((t) => ancestorsInclusive(t))),
+];
+// `EXPLAIN ANALYZE` on a DELETE really deletes, so every write plan is taken inside a rolled-back
+// transaction — the fixture the rest of this file EXPLAINs against has to survive it.
+const rollback = async (fn: () => Promise<void>): Promise<void> => {
+  await c.query('BEGIN');
+  try {
+    await fn();
+  } finally {
+    await c.query('ROLLBACK');
+  }
+};
+
+for (const n of [5, 2202]) {
+  test(`§5.17 write: the descendant DELETE is index-served on nodes at a ${n}-write group`, async (t) => {
+    // THE assertion of this file's §5.17 half. Every `assertNoSeqScan` above is on `oplog`; there
+    // was not one on `nodes` for a write, which is exactly how a Nested Loop over a Seq Scan of
+    // `nodes` shipped inside the `rev_counter` lock and was described in the commit message as
+    // index-driven.
+    await rollback(async () => {
+      const targets = GROUP(n);
+      const nodes = await plan(t, `descendant range join (${n})`, DELETE_RANGE_SQL, [
+        targets.map((p) => `${p}/`),
+        targets.map((p) => `${p}0`),
+      ]);
+      assertNoSeqScan(nodes, 'nodes', `the batched descendant DELETE at ${n} targets`);
+      assert.ok(
+        nodes.some((node) => node['Index Name'] === 'nodes_path_pattern'),
+        `it must reach nodes through nodes_path_pattern, got ${nodes.map((node) => node['Index Name']).join(', ')}`,
+      );
+    });
+  });
+
+  test(`§5.17 write: the exact-half DELETE joins nothing, so its worst case is ONE scan (${n})`, async (t) => {
+    // Deliberately NOT assertNoSeqScan. At 7,107 array entries the planner takes a single seq scan
+    // over thousands of index probes and is right to — measured 23 ms at 400k rows against 2,202
+    // round trips it replaces. What must never come back is a JOIN: `= ANY(array)` is one relation
+    // and one pass, and the shape below proves the planner is choosing, not stuck.
+    await rollback(async () => {
+      const nodes = await plan(t, `exact half (${n})`, DELETE_EXACT_SQL, [exactArray(GROUP(n))]);
+      assert.deepEqual(
+        nodes.filter((node) => node['Node Type'] === 'Function Scan'),
+        [],
+        'the exact half must stay a single-relation predicate — a join here is O(array x rows)',
+      );
+      if (n === 5) assertNoSeqScan(nodes, 'nodes', 'the exact half at a p50 group');
+    });
+  });
+}
+
+test('§5.17 write: a lone target takes ONE statement, and it is index-served', async (t) => {
+  // The ordered-fallback path runs this once per write inside the lock, so a second round trip here
+  // is the cost the batching exists to remove, paid back on the collision case.
+  await rollback(async () => {
+    const nodes = await plan(t, 'solo delete', DELETE_SOLO_SQL, [
+      ancestorsInclusive('MPK_7/7'),
+      'MPK_7/7/',
+      'MPK_7/70',
+    ]);
+    assertNoSeqScan(nodes, 'nodes', 'the single-target DELETE');
+  });
+});
+
+test('§5.17 write: the LIKE-on-a-COLUMN shape we did NOT ship seq-scans nodes at every size', async (t) => {
+  // The regression, kept as a plan. `n.path LIKE t.pat` cannot use an index because a LIKE prefix
+  // is only an index bound when the pattern is known at PLAN time, and `t.pat` is a column — so
+  // this loses the index unconditionally, not past some array size. Five targets is enough to show
+  // it, which is the fact the "sized, not measured" payoff model missed.
+  await rollback(async () => {
+    const targets = GROUP(5);
+    const nodes = await plan(
+      t,
+      'LIKE join (not shipped)',
+      `DELETE FROM nodes n USING unnest($1::text[], $2::text[]) AS t(p, pat)
+        WHERE n.path = t.p OR n.path LIKE t.pat ESCAPE '\\'`,
+      [targets, targets.map((p) => likeDescendants(p))],
+    );
+    const seq = nodes.filter((node) => node['Node Type'].includes('Seq Scan') && node['Relation Name'] === 'nodes');
+    assert.equal(seq.length, 1, 'the shape we did NOT ship is the seq scan this test exists to avoid');
+  });
 });
 
 // ---------------------------------------------------------------- §5.6 the sidebar's skip scan
