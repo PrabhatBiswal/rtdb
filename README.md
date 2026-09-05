@@ -41,6 +41,22 @@ table is absent by decision.
 
 ---
 
+## The console
+
+![The RTDB console watching a path: a live tree of three room records with typed values, showing the
+connection state, the current revision and the number of open subscriptions](console/screenshot.png)
+
+Sign in, watch a path, edit the tree, manage users across three roles. Expanding a node subscribes
+to it and collapsing unsubscribes, so the console is bound by the same `SNAPSHOT_MAX` limit as any
+other client — the root is deliberately not watchable. It ships in this repository and runs against
+your own gateway with no AWS; see [Running the console](#running-the-console).
+
+That screenshot is a local run: `ws://127.0.0.1:8080`, six seeded paths, and the namespaces sidebar
+reading `unavailable` because it discovers gateways through Prometheus, which a local run does not
+have. Everything else works without it.
+
+---
+
 ## What's in here
 
 Everything below is in this repository — the server, both clients, the admin UI, the
