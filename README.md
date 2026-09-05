@@ -14,6 +14,31 @@ compare-and-swap for contended values, and horizontal fanout across more than on
 - **Not tied to this repo's deployment.** The SDK talks to any `wss://` URL that speaks the
   protocol. Nothing in it is hardcoded to a particular backend.
 
+### What Firebase has that this does not
+
+"Mostly mechanical" is a claim about call sites, not about coverage. These are the gaps a port hits,
+as of protocol v1.5:
+
+| Firebase | Here |
+|---|---|
+| Security Rules | **Nothing ships.** `allowAll` is the only implementation — see [Authentication](#authentication) before you deploy. |
+| Queries — `orderByChild`, `limitToLast`, `startAt`, `equalTo` | Absent. §11 E2 designs `orderByKey` with `limitToFirst`/`limitToLast`; `orderByChild` needs server-side indexes and is explicitly out of scope. |
+| `push()` | Absent — generate keys yourself. §11 E3 specifies Firebase's exact push-id algorithm, so that keys interleave correctly if you ever dual-write against a real Firebase. |
+| `ServerValue.TIMESTAMP` | Absent. §11 E4 puts server time in `helloAck` and resolves `{".sv":"timestamp"}` at commit. |
+| `runTransaction()` | Not wrapped. Compare-and-swap is the shipped answer: read the rev you saw, write against it, retry with what won. |
+| `onDisconnect()` / presence | Absent, and not designed. No protocol support at all. |
+| `keepSynced()`, disk persistence | Absent. The mirror is memory-only; a cold start re-fetches. Offline *writes* do survive a disconnect — offline *reads* do not survive a process restart. |
+| One-shot `get()` | Absent — subscribe and take the first snapshot. §11 E1. |
+| REST API | None. WebSocket only, so no `curl`-able reads and no webhook-shaped integrations. |
+| Priorities, `onChildMoved`, `previousChildName` | Deliberately not implemented. |
+
+`.info/connected` does work, and so do `updateChildren` across several keys, child events, and the
+offline write queue.
+
+The rows carrying an E-number are designed in [`PROTOCOL.md`](PROTOCOL.md) §11 — design-ready,
+scheduled separately, not implemented. Design-ready is not a delivery date. Everything else in that
+table is absent by decision.
+
 ---
 
 ## What's in here
@@ -174,6 +199,28 @@ docker run --rm -p 8080:8080 \
 
 The image runs the TypeScript sources directly (no build step) and handles `SIGTERM` itself: on
 `docker stop` it closes the listener, then the database pool and Redis connections, then exits 0.
+
+### The whole stack on a laptop
+
+`deploy/compose.prod.yml` is the production shape, minus AWS: **two** gateways on one shard, a real
+Postgres, a real Redis, and Prometheus + Grafana with the dashboards already provisioned. It is the
+fastest way to see fanout, leader election and the metrics doing something.
+
+```bash
+export RTDB_DEV_SECRET="$(openssl rand -hex 32)"
+docker compose -f deploy/compose.prod.yml up --build -d
+```
+
+Gateways on `ws://127.0.0.1:8081` and `:8082`, Grafana on `:3000` (`admin` / `$GRAFANA_PASSWORD`),
+Prometheus on `:9090`. Postgres is published on **5433** and Redis on **6380** so neither collides
+with one you already run. The health checks call the real `/healthz`, which reaches storage — stop
+Postgres and the containers go unhealthy, which is the point of them.
+
+This is also the rig the load tools expect:
+
+```bash
+node --import tsx scripts/loadsim.ts --gateways ws://127.0.0.1:8081,ws://127.0.0.1:8082
+```
 
 ### On AWS, with Terraform
 

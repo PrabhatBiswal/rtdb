@@ -18,6 +18,10 @@ x-gateway: &gateway
     RTDB_PORT: 8080
     RTDB_ADMIN_PORT: 9090
     RTDB_STORAGE: postgres
+    # main.ts refuses to start on postgres without this, and it is right to: the fallback is a
+    # secret that is a literal in this repository. `:?` fails at `compose up` with this message
+    # instead of leaving two containers in a crash loop saying it one line at a time.
+    RTDB_DEV_SECRET: ${RTDB_DEV_SECRET:?export RTDB_DEV_SECRET="$(openssl rand -hex 32)" first}
     RTDB_PG_URL: postgres://rtdb:rtdb@postgres:5432/rtdb
     RTDB_REDIS_URL: redis://redis:6379
     RTDB_SHARD: 0
