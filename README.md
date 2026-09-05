@@ -275,13 +275,31 @@ creating a policy that points somewhere else.
 Tokens are HS256 JWTs. The gateway verifies them with `RTDB_DEV_SECRET` and takes the `sub` claim
 as the user id.
 
-**There is no rules language, and the default authorizes everything.** A rules function is called on
-every subscription and every write, but the one that ships is `allowAll`, and the gateway passes no
-other — so **any token this gateway accepts can read and write the entire tree**. If you are
-replacing Firebase, this is the half of it that is not here: authentication is enforced, and
-authorization is yours to write. `Rules` is a plain function in `src/pipeline/rules.ts`; pass your
-own through `startGateway({ rules })` and it is consulted per path with the subject and the
-operation. Treat a deployment without one as a database whose only door is the token.
+**Authorization is a function you write, and there is no rules language.** If you are replacing
+Firebase, this is the half of it that is not here: Security Rules are a language with `.read`,
+`.write`, `$wildcards` and cascading; what you get here is a TypeScript function and the places it
+is called from.
+
+```bash
+RTDB_RULES=rules/own-subtree.ts node --import tsx src/gateway/main.ts
+```
+
+The module exports `rules` — a function taking the subject, the operation and the path, called once
+per write and once per `listen`, never per delta. `rules/own-subtree.ts` is a working example: each
+user may read and write only under their own id.
+
+**A deployment on Postgres refuses to start without it.** Without rules the gateway runs `allowAll`,
+and then authentication is the only thing between a token and the tree: any client that can connect
+can write any path. That includes paths nobody declared — **a namespace is not declared anywhere**,
+it is the first segment of a path and it exists as soon as something is written under it, so the
+server cannot refuse an "unknown" namespace on its own. Your rules are where it becomes able to. In
+memory storage the same situation is a warning rather than a refusal, so trying the project out
+stays one command.
+
+One thing to know before you write your own: **console sessions must be let through.** They carry
+`console-…` subjects, which match no user's subtree, so a naive own-subtree rule locks the console
+out of the tree it administers. What a console session may write is already decided by an invariant
+in `src/pipeline/rules.ts` that runs *before* your rules and that no rules module can vote down.
 
 In production, mint tokens in your own backend or IdP with the same secret — the gateway only ever
 verifies, it never issues. For local work there is a helper:

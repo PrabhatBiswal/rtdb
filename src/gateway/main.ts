@@ -9,6 +9,9 @@ import { startAdminServer } from './metrics.ts';
 import { startGateway } from './server.ts';
 import { makeLimits, type Limits } from '../protocol/limits.ts';
 import type { StorageAdapter } from '../storage/adapter.ts';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import type { Rules } from '../pipeline/rules.ts';
 import { MemoryStorage } from '../storage/memory.ts';
 import { PostgresStorage } from '../storage/postgres.ts';
 
@@ -98,6 +101,52 @@ if (!process.env['RTDB_DEV_SECRET']) {
   );
 }
 
+/**
+ * Authorization. The gateway's default is `allowAll` (rules.ts) and `startGateway` takes it when
+ * nothing is passed, so a deployment that configures no rules authenticates every client and then
+ * authorizes all of them for everything: any token that can connect can write any path.
+ *
+ * That includes paths nobody declared. A namespace is not declared anywhere — it is the first
+ * segment of a path and it exists as soon as something is written under it — so the server cannot
+ * refuse an "unknown" namespace on its own. A rules module is where it becomes able to.
+ *
+ * Same line as the secret above, for the same reason: `RTDB_STORAGE=postgres` means a real
+ * deployment, and a real deployment with no authorization is a world-writable database. Memory
+ * storage is somebody trying it out, and a loud line serves them better than a refusal.
+ *
+ * The module must export `rules` (or a default) as a function. `rules/own-subtree.ts` is a working
+ * example, and it is the smallest one that is not a toy.
+ */
+const rulesPath = process.env['RTDB_RULES'];
+let rules: Rules | undefined;
+if (rulesPath) {
+  // Resolved against the WORKING DIRECTORY, not this module: `RTDB_RULES=rules/mine.ts` has to mean
+  // what it looks like it means from the shell that typed it.
+  const mod = (await import(pathToFileURL(resolve(rulesPath)).href)) as {
+    rules?: unknown;
+    default?: unknown;
+  };
+  const fn = mod.rules ?? mod.default;
+  if (typeof fn !== 'function') {
+    throw new Error(
+      `RTDB_RULES=${rulesPath} loaded, but it exports no rules function — expected \`export const rules\` ` +
+        'or a default export. Refusing to start rather than falling back to allowAll, which is what ' +
+        'this variable exists to replace.',
+    );
+  }
+  rules = fn as Rules;
+} else if (storage instanceof PostgresStorage) {
+  throw new Error(
+    'RTDB_STORAGE=postgres requires RTDB_RULES: without it every authenticated client may read and ' +
+      'write every path, including top-level namespaces nobody declared. See rules/own-subtree.ts.',
+  );
+} else {
+  process.stderr.write(
+    'rtdb WARNING: RTDB_RULES is unset, so every authenticated client can read and write the entire ' +
+      'tree. Fine for local development. See rules/own-subtree.ts before exposing this.\n',
+  );
+}
+
 const gw = await startGateway({
   port,
   limits,
@@ -105,6 +154,7 @@ const gw = await startGateway({
   shard,
   ...(redis ? { redis } : {}),
   ...(prune ? { prune } : {}),
+  ...(rules ? { rules } : {}),
   ...(lockTtlMs > 0 ? { lockTtlMs } : {}),
 });
 

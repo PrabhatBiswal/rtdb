@@ -165,9 +165,10 @@
   .roots-head { display:flex; align-items:center; gap:6px; padding:0 12px 8px;
                 color:var(--dimmer); font-size:10.5px; letter-spacing:.13em; text-transform:uppercase; }
   .roots-head .grow { flex:1; }
-  #roots-refresh { background:none; border:0; color:var(--dimmer); cursor:pointer; font-size:12px;
+  #roots-refresh, #roots-add { background:none; border:0; color:var(--dimmer); cursor:pointer; font-size:12px;
                    padding:0 2px; line-height:1; }
-  #roots-refresh:hover { color:var(--fg); }
+  #roots-refresh:hover, #roots-add:hover { color:var(--fg); }
+  #roots-add { font-size:15px; line-height:1; }
   .root { display:block; width:100%; text-align:left; background:none; border:0; cursor:pointer;
           font-family:var(--mono); font-size:12.5px; color:var(--fg);
           padding:5px 12px; border-left:2px solid transparent; }
@@ -408,7 +409,7 @@
 
 <div id="workspace">
 <aside id="roots" hidden>
-  <div class="roots-head"><span>namespaces</span><span class="grow"></span><button id="roots-refresh" title="refresh (the gateway caches this for 10s)">&#8635;</button></div>
+  <div class="roots-head"><span>namespaces</span><span class="grow"></span><button id="roots-add" title="add a top-level namespace" hidden>+</button><button id="roots-refresh" title="refresh (the gateway caches this for 10s)">&#8635;</button></div>
   <div class="roots-note" id="roots-note">not loaded</div>
 </aside>
 <div id="tree"><div class="empty"><b>Not connected</b><span id="empty-hint">Sign in to begin.</span></div></div>
@@ -1106,6 +1107,13 @@ function drillTo(path) {
 
 $('#roots-refresh').addEventListener('click', () => loadRoots(true));
 
+// A namespace is not something this system creates. It is the first segment of a path and it comes
+// into being on the first write under it — §1 stores nothing for null or {}, so an "empty namespace"
+// cannot exist. The editor already builds a top-level path when the parent is root, so this offers
+// the one route the tree cannot: root is never listenable (§3), which means no node on screen is
+// ever the place you could click "add" to make one.
+$('#roots-add').addEventListener('click', () => openEditor('add', ''));
+
 /**
  * §5.6: the root namespaces. Served by the ops auth-server, which proxies the gateway's ADMIN port —
  * this never goes over the wire protocol, because §3 has no way to ask "what is at the top" and
@@ -1311,6 +1319,8 @@ if (SERVED) {
       authToken = d.token;
       myRole = d.role || '';
       $('#users-btn').hidden = myRole !== 'owner';
+      // Offered on the same terms as every other write control: an affordance, not the guard.
+      $('#roots-add').hidden = !canWrite();
       // The tag has said "read-only" since this console existed. For a session that can write, that
       // is now a lie, and the one thing a person should never be wrong about is whether their clicks
       // change production.
@@ -1536,7 +1546,11 @@ const edMsg = (text, ok) => {
 function openEditor(mode, path) {
   editTarget = { mode, path };
   $('#ed-title').textContent = mode === 'add' ? 'Add a child' : 'Set value';
-  $('#ed-path').textContent = mode === 'add' ? path + '/…' : path;
+  // Root reads as `/…` under the plain rule, and paths here have no leading slash — so that renders
+  // a shape the system does not use, in the one dialog where somebody is naming a namespace for the
+  // first time and has nothing else to go on.
+  $('#ed-path').textContent =
+    mode !== 'add' ? path : path === '' ? '…  (new top-level namespace)' : path + '/…';
   $('#ed-key-row').hidden = mode !== 'add';
   $('#ed-key').value = '';
   $('#ed-type').value = 'string';
@@ -1697,6 +1711,7 @@ setState = function (s) {
     // The token is dead; so is anything it authorised. Put the panel away rather than leaving a
     // button that can only produce 401s.
     myRole = ''; $('#users-btn').hidden = true; $('#users').hidden = true;
+    $('#roots-add').hidden = true;
     $('#mode-tag').textContent = 'read-only';
     $('#edit').hidden = true;
     $('#login').hidden = false;
