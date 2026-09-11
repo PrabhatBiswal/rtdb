@@ -8,8 +8,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-timeout=20000 test/*/*.test.ts",
-    "test:pg": "RTDB_STORAGE=postgres node --import tsx --test --test-timeout=30000 test/pg/*.pgtest.ts test/integration/*.test.ts",
+    "test": "node --import tsx --test --test-timeout=40000 test/*/*.test.ts",
+    "test:pg": "RTDB_STORAGE=postgres node --import tsx --test --test-concurrency=4 --test-timeout=30000 test/pg/*.pgtest.ts test/integration/*.test.ts",
     "test:bus": "node --import tsx --test --test-timeout=40000 test/bus/*.bustest.ts && npm run test:redis",
     "test:redis": "RTDB_TEST_REDIS=1 node --import tsx --test --test-timeout=40000 test/integration/*.test.ts",
     "chaos": "node --import tsx --test --test-timeout=60000 test/chaos/*.test.ts",

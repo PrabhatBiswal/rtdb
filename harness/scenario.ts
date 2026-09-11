@@ -34,6 +34,7 @@ export class GatewayProcess {
   /** Postgres schemas this process has run on, so they can be dropped when it stops for good. */
   readonly #schemas: string[] = [];
   #schema: string | null = null;
+  #control: string | null = null;
 
   private constructor(
     private readonly limits: Partial<Limits>,
@@ -74,6 +75,10 @@ export class GatewayProcess {
         // process signs tokens with, so setting only the child's would make the child reject every
         // token the parent mints. Whatever the suite runs under, both halves agree.
         RTDB_DEV_SECRET: devSecret(),
+        // And the same story for rules: main.ts refuses postgres without RTDB_RULES (§5.19), so the
+        // harness names the policy it wants instead of inheriting one. See the file for why it is a
+        // file and not an env-var shaped hole in the guard.
+        RTDB_RULES: 'harness/allow-all-rules.ts',
         ...this.#storageEnv(),
         ...this.extraEnv,
       },
@@ -105,11 +110,21 @@ export class GatewayProcess {
     if (!isPostgres()) return this.persist ? { RTDB_PERSIST: this.persist } : {};
     if (this.#schema === null || !this.persist) {
       this.#schema = uniqueSchema('chaos');
-      this.#schemas.push(this.#schema);
+      this.#control = uniqueSchema('chaosctl');
+      this.#schemas.push(this.#schema, this.#control);
     }
     // main.ts refuses to guess a URL — a production gateway silently defaulting to localhost is a
     // worse failure than not starting — so the harness, which knows it, hands it over.
-    return { RTDB_PG_URL: PG_URL, RTDB_PG_SCHEMA: this.#schema };
+    //
+    // §5.22 Gate A: its OWN control schema too, for the same reason it gets its own tenant schema.
+    // Left unset, every scenario in the suite would share the default `rtdb_control` in this one
+    // database — and, worse, would LEAVE it behind, because a schema nobody minted is a schema
+    // nobody drops.
+    return {
+      RTDB_PG_URL: PG_URL,
+      RTDB_PG_SCHEMA: this.#schema,
+      RTDB_CONTROL_SCHEMA: this.#control ?? uniqueSchema('chaosctl'),
+    };
   }
 
   /** SIGKILL by default: no close frames, no graceful shutdown — the process simply stops. */

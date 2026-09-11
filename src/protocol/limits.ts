@@ -18,6 +18,15 @@ export interface Limits {
   /** Per-connection write rate; beyond -> RATE (§9). */
   WRITE_RATE_PER_SEC: number;
   WRITE_RATE_BURST: number;
+  /**
+   * Per-DATABASE lock acquisitions; beyond -> RATE (§9, §5.23). A different unit from the two
+   * above on purpose: a connection is quotaed in WRITES because that is what a client controls,
+   * and a database in ACQUISITIONS because that is what the shard runs out of. Measured, the two
+   * differ by 500x on shape alone (`scripts/quota-unit.ts`), which is why one cannot stand in for
+   * the other.
+   */
+  QUOTA_ACQ_PER_SEC: number;
+  QUOTA_ACQ_BURST: number;
   /** Group-commit window for put/merge, ms (§4 step 2; WORKLOAD §4). */
   GROUP_COMMIT_MS: number;
   /** Delta micro-batch window, ms — engaged only on a non-empty send queue (§3 batch; WORKLOAD §4). */
@@ -51,6 +60,19 @@ export const DEFAULT_LIMITS: Limits = {
   OPLOG_RETENTION_REVS: 500_000,
   WRITE_RATE_PER_SEC: 100,
   WRITE_RATE_BURST: 500,
+  /**
+   * §5.23 faisla 4, the user's number. HALF the measured shard ceiling of ~129 acq/s (P2:
+   * `rev_counter … FOR UPDATE` held >= 7.74ms): one database may not take more than half the
+   * shard, two can, and that division IS the quota — headroom is shared out, not created
+   * (§5.21 R3). Burst 128 = two seconds of the sustained rate, and since one burst of any size is
+   * a single acquisition, it is a generous number for the shape it is generous to.
+   *
+   * A trickling client at 100 writes/s WILL be refused here, and that is the decision rather than
+   * an accident: measured, that client spends 95 acq/s of the shard while a bursty one spends 19
+   * for 2000 writes/s.
+   */
+  QUOTA_ACQ_PER_SEC: 64,
+  QUOTA_ACQ_BURST: 128,
   GROUP_COMMIT_MS: 5,
   DELTA_BATCH_MS: 20,
   IDLE_TIMEOUT_SEC: 70,

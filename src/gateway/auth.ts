@@ -1,4 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { validateDatabaseName } from '../protocol/path.ts';
+import { DEFAULT_LIMITS } from '../protocol/limits.ts';
 
 /**
  * §2: the token is validated ONCE, at connect time. `reauth` is reserved for v2.
@@ -11,8 +13,14 @@ export type AuthResult =
    * `role` is the console's role claim (§5.8), carried through so the gateway can decide a write on
    * it (§5.9). It is optional and null for every app token, which have never had one and are not
    * meant to grow one: this is a claim OUR console mints for OUR console's sessions.
+   *
+   * `ns` is §5.20 Phase 1's database claim: the ONE top-level segment this token may touch. It is a
+   * single path segment, never a path — a token confined to a subtree deeper than a database is not
+   * a thing the product sells, and allowing one here would put a second path grammar next to §1's.
+   * Absent means the token names no database, and what that MEANS is decided in `rules.ts`, not
+   * here: this file reports the claim, the invariant decides.
    */
-  | { ok: true; userId: string; role?: string | null }
+  | { ok: true; userId: string; role?: string | null; ns?: string | null }
   | { ok: false; msg: string };
 
 export interface AuthValidator {
@@ -68,7 +76,12 @@ export class DevHs256Validator implements AuthValidator {
       return { ok: false, msg: 'malformed token claims' };
     }
     if (typeof claims !== 'object' || claims === null) return { ok: false, msg: 'malformed token claims' };
-    const { sub, exp, role } = claims as { sub?: unknown; exp?: unknown; role?: unknown };
+    const { sub, exp, role, ns } = claims as {
+      sub?: unknown;
+      exp?: unknown;
+      role?: unknown;
+      ns?: unknown;
+    };
 
     // JWT `exp` is in SECONDS. Connect-time only: a token that expires mid-session stays valid
     // until the connection drops (§2, accepted).
@@ -78,10 +91,33 @@ export class DevHs256Validator implements AuthValidator {
     }
     if (typeof sub !== 'string' || sub === '') return { ok: false, msg: 'token has no sub' };
 
+    // A malformed `ns` is REFUSED, not dropped. Dropping would be quietly fail-open under §5.20's
+    // rollout: `outsideOwnDatabase` reads absence as "this token names no database", so a typo in a
+    // minted claim would turn a confined token into an unconfined one.
+    //
+    // §5.22 Gate D: `validateDatabaseName`, the same rule the registry and the admin route use —
+    // its fourth caller, and the reason is the token is the DOOR. `validateSegment` accepted
+    // `_default`, so a token could name a synthetic metrics label and be handed to a tenant factory
+    // as if it were a database. Checking it here means `tenantFor`'s input is already trusted and
+    // the map needs no guard of its own.
+    //
+    // Whether the database EXISTS is deliberately not asked: that is the mint's job (`/app-token`
+    // refuses an undeclared name), and hello is not a place to spend a registry round trip.
+    if (ns !== undefined && ns !== null) {
+      if (validateDatabaseName(ns, DEFAULT_LIMITS) !== null) {
+        return { ok: false, msg: 'malformed token ns' };
+      }
+    }
+
     // A non-string role is not a role, and a token without one yields a result with NO `role` key at
     // all — byte-identical to what this returned before §5.9 existed. That is not tidiness: it is why
     // `test/unit/auth.test.ts`'s round-trip assertion still passes UNMODIFIED, which is a cheap
     // standing proof that app tokens are untouched by the console's role plumbing.
-    return typeof role === 'string' ? { ok: true, userId: sub, role } : { ok: true, userId: sub };
+    return {
+      ok: true,
+      userId: sub,
+      ...(typeof role === 'string' ? { role } : {}),
+      ...(typeof ns === 'string' ? { ns } : {}),
+    };
   }
 }

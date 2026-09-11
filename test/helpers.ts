@@ -84,12 +84,18 @@ export function waitForFrame<T extends Record<string, unknown>>(
 export function testStorage(limits: Limits): { storage: StorageAdapter; cleanup: () => Promise<void> } {
   if (!isPostgres()) return { storage: new MemoryStorage(limits), cleanup: () => Promise.resolve() };
   const schema = uniqueSchema();
-  const storage = new PostgresStorage({ url: PG_URL, limits, schema });
+  // Its OWN control schema, and this is the one suite that needs one: `test/pg/helper.ts` gives
+  // each FILE a whole Postgres database, but these harnesses share `PG_URL` and run in parallel, so
+  // the default control schema would be one registry for every test at once. A leftover schema is
+  // also a leftover here — both go.
+  const controlSchema = uniqueSchema('c');
+  const storage = new PostgresStorage({ url: PG_URL, limits, schema, controlSchema });
   return {
     storage,
     cleanup: async () => {
       await storage.close();
       await dropSchema(schema);
+      await dropSchema(controlSchema);
     },
   };
 }

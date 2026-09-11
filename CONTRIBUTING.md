@@ -23,7 +23,7 @@ is a local dependency, so running one from elsewhere reports `Cannot find packag
 
 ```bash
 npm ci
-npm run check      # typecheck + 221 unit and integration tests. No infrastructure needed.
+npm run check      # typecheck + 324 unit and integration tests. No infrastructure needed.
 npm run chaos      # 11 scenarios, including SIGKILL on a gateway under live traffic.
 npm run test:pg    # needs a Postgres; tests create and drop their own databases.
 npm run test:bus   # needs a Redis binary on PATH — the suites kill the Redis they spawned.
@@ -35,7 +35,7 @@ CI runs all of it, plus a build-boot-scrape-SIGTERM cycle on the Docker image. A
 
 ## The wire protocol is frozen
 
-`PROTOCOL.md` is v1.5 and normative. Both SDKs, the console and the test harness are all clients of
+`PROTOCOL.md` is v1.6 and normative. Both SDKs, the console and the test harness are all clients of
 it, so a frame change is never a local change. If you need one: add a §12 changelog entry, bump the
 version, and say in the PR what an old client does when it meets a new server. Unknown frame types
 and unknown fields must stay ignorable — that rule is what lets extensions ship without breaking

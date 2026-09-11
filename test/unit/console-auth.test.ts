@@ -4,10 +4,12 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { createServer as netServer } from 'node:net';
-import { scryptSync, randomBytes } from 'node:crypto';
+import { scryptSync, randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateDatabaseName } from '../../src/protocol/path.ts';
+import { DEFAULT_LIMITS } from '../../src/protocol/limits.ts';
 
 /**
  * The console's front door, exercised as the thing it is: a process, over HTTP, with a fake `aws`
@@ -63,7 +65,9 @@ interface Rig {
   proc: ReturnType<typeof spawn>;
   log: () => string;
   ssmDir: string;
-  prom: Server;
+  ops: Server;
+  /** What the stub shard reports as its declared databases. Mutable between calls. */
+  shard: { names: string[]; declared: string[]; defaultDb: string };
   dir: string;
 }
 
@@ -77,17 +81,88 @@ const freePort = (): Promise<number> =>
     });
   });
 
-/** A stub Prometheus, so /stats answers 200 for an authorized caller instead of 502. */
-function stubProm(port: number): Server {
-  const s = createServer((_req, res) => {
+/**
+ * The ops box, stubbed: a Prometheus for /stats AND the gateway admin port behind it.
+ *
+ * One server for both because the server under test does not take a gateway address — it DISCOVERS
+ * one, by asking Prometheus for an active `rtdb-gateway` target and using that target's own
+ * `__address__`. Pointing that address back at this same listener is the whole stub: it exercises
+ * the real discovery path rather than skipping it, and a caller still cannot name a host, a port or
+ * a path (which is the property `/topnodes` and `/app-token` are actually relying on).
+ */
+function stubOps(port: number, shard: { names: string[]; declared: string[]; defaultDb: string }): Server {
+  const s = createServer((req, res) => {
+    const url = (req.url ?? '').split('?')[0];
+    /**
+     * FIRST, because it is the only branch that answers a status of its own — everything below
+     * writes a blanket 200 header before it looks at the path.
+     *
+     * §5.24 Gate D: the stub keeps a REAL registry, so a declare through this rig changes what
+     * `/topnodes` answers next; without that, a broken cache invalidation looked exactly like a
+     * working one. §5.26: and it REFUSES an illegal name with 400, the way the gateway's admin
+     * route does with the shared `validateDatabaseName` — a stub that accepted everything is what
+     * let the auth-server's "turn a 400 into a 503" go unnoticed.
+     */
+    if (req.method === 'POST' && url === '/databases') {
+      let body = '';
+      req.on('data', (c: Buffer) => { body += c.toString(); });
+      req.on('end', () => {
+        const name = (JSON.parse(body || '{}') as { name?: string }).name;
+        // §5.27: the RULE, not a copy of it. A regex here was a second idea of a legal name living
+        // in the rig that checks the first one — and now that the route answers WHICH rule broke,
+        // a hand-written stub would also have to invent the sentences, which is the Gate E shape
+        // again one layer out.
+        const why = validateDatabaseName(name, DEFAULT_LIMITS);
+        if (why !== null) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          return void res.end(JSON.stringify({ error: why }));
+        }
+        // `validateDatabaseName` returning null already means a non-empty string; the cast is the
+        // gateway route's own (`metrics.ts:782`), not a second opinion about the type.
+        const db = name as string;
+        if (!shard.declared.includes(db)) {
+          shard.declared.push(db);
+          shard.names = [...shard.names, db].sort();
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
+    if (url === '/api/v1/targets') {
+      return void res.end(JSON.stringify({
+        status: 'success',
+        data: {
+          activeTargets: [{
+            labels: { job: 'rtdb-gateway' },
+            health: 'up',
+            discoveredLabels: { __address__: `127.0.0.1:${port}` },
+          }],
+        },
+      }));
+    }
+    // §5.22 Gate F-3: the gateway's admin route sends BOTH lists — every top-level name for the
+    // sidebar, and the registry alone for the two mints. A stub that only sent `names` would be
+    // testing a gateway that no longer exists.
+    if (url === '/topnodes') return void res.end(JSON.stringify(shard));
     res.end(JSON.stringify({ status: 'success', data: { result: [{ metric: {}, value: [0, '7'] }] } }));
   });
   s.listen(port, '127.0.0.1');
   return s;
 }
 
-async function startServer(opts: { admin?: unknown; users?: unknown; shadowKey?: string; deny?: string } = {}): Promise<Rig> {
+async function startServer(
+  opts: {
+    admin?: unknown; users?: unknown; shadowKey?: string; deny?: string;
+    /** DECLARED databases — what the registry holds, and the only names a mint may name. */
+    databases?: string[];
+    /** Top-level names that have DATA but were never declared: the default tenant's own subtrees. */
+    raw?: string[];
+    /** §5.25 Gate 4: the ONE websocket origin the CSP allows and the page's box is filled with. */
+    wss?: string;
+  } = {},
+): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), 'console-auth-'));
   const bin = join(dir, 'bin');
   const ssmDir = join(dir, 'ssm');
@@ -105,7 +180,14 @@ async function startServer(opts: { admin?: unknown; users?: unknown; shadowKey?:
 
   const port = await freePort();
   const promPort = await freePort();
-  const prom = stubProm(promPort);
+  const declaredNames = opts.databases ?? ['car_race'];
+  const shard = {
+    names: [...declaredNames, ...(opts.raw ?? [])].sort(),
+    declared: declaredNames,
+    // §5.24 Gate C: the schema this gateway serves when a token names none.
+    defaultDb: 'public',
+  };
+  const ops = stubOps(promPort, shard);
 
   const proc = spawn(process.execPath, [SERVER], {
     env: {
@@ -116,6 +198,7 @@ async function startServer(opts: { admin?: unknown; users?: unknown; shadowKey?:
       PORT: String(port),
       CONSOLE_HTML: HTML,
       PROM_URL: `http://127.0.0.1:${promPort}`,
+      ...(opts.wss ? { CONSOLE_WSS: opts.wss } : {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -128,12 +211,12 @@ async function startServer(opts: { admin?: unknown; users?: unknown; shadowKey?:
     if (Date.now() > deadline) throw new Error(`server never listened:\n${out}`);
     await new Promise((r) => setTimeout(r, 25));
   }
-  return { port, proc, log: () => out, ssmDir, prom, dir };
+  return { port, proc, log: () => out, ssmDir, ops, shard, dir };
 }
 
 function stop(rig: Rig): void {
   rig.proc.kill('SIGKILL');
-  rig.prom.close();
+  rig.ops.close();
   rmSync(rig.dir, { recursive: true, force: true });
 }
 
@@ -632,4 +715,537 @@ test('an owner may reset their OWN password — resetting is not demoting (§5.8
     assert.equal(remove.status, 409, 'self-removal is still refused');
     assert.equal(storeIn(rig)[OWNER.email]?.role, 'owner');
   } finally { stop(rig); }
+});
+
+// ------------------------------------------------------------------- §5.20 Phase 1: /app-token
+
+/**
+ * The mint the client's own console uses to hand a database to their dev team. If this endpoint
+ * does not exist, "the client gets a console" stops being true — they would need a backend of their
+ * own to issue their team a credential.
+ *
+ * These run against the real process with the real discovery path, like everything else in this
+ * file: the shard's declared databases come back through the stubbed Prometheus target, not through
+ * a seam opened for the test.
+ */
+const appToken = (rig: Rig, token: string, body: unknown) =>
+  call(rig, '/app-token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+
+/** The signature, recomputed. A token is proven by verifying it, not by reading its middle third. */
+const signedWith = (token: string, secret: string): boolean => {
+  const [head, body, mac] = token.split('.') as [string, string, string];
+  const expected = createHmac('sha256', secret).update(`${head}.${body}`).digest();
+  const got = Buffer.from(mac, 'base64url');
+  return got.length === expected.length && timingSafeEqual(got, expected);
+};
+
+test('an owner mints an app token confined to one database, and the gateway can verify it', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['car_race', 'chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await appToken(rig, session['token'] as string, { database: 'car_race', app: 'android' });
+    assert.equal(r.status, 201);
+    assert.equal(r.body['sub'], 'app-car_race-android');
+    assert.equal(r.body['database'], 'car_race');
+
+    const c = claims(r.body['token'] as string);
+    assert.equal(c['ns'], 'car_race', 'the claim the gateway keys the wall off');
+    assert.equal(c['sub'], 'app-car_race-android');
+    assert.equal('role' in c, false, 'an app token is not a console session and must not read like one');
+    assert.equal(typeof c['exp'], 'number', 'expiry is half of revocation; the other half is §10 kick');
+
+    // Signed with the SHARD secret, which is the point: the console signs what the gateway verifies.
+    assert.equal(signedWith(r.body['token'] as string, 'test-secret-for-console-auth'), true);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('the app token subject is DERIVED, never taken from the caller', async () => {
+  // This is the root of the whole wall. `outsideOwnDatabase` and `consoleWriteDenied` both exempt
+  // `console-` subjects, so a caller who could choose its own `sub` would pick one and walk out.
+  const rig = await startServer({ admin: adminRecord() });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await appToken(rig, session['token'] as string, {
+      database: 'car_race',
+      app: 'android',
+      sub: 'console-rw-evil',
+    });
+    assert.equal(r.status, 201);
+    assert.equal(r.body['sub'], 'app-car_race-android', 'the body sub is ignored, not honoured');
+    assert.equal(claims(r.body['token'] as string)['sub'], 'app-car_race-android');
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a hostile app name cannot escape the subject shape', async () => {
+  // The app name reaches a token subject, and §10's kick targets that string. `deviceSlug` is the
+  // same squeeze /shadow-token already applies to a device id.
+  const rig = await startServer({ admin: adminRecord() });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await appToken(rig, session['token'] as string, { database: 'car_race', app: 'console-rw-x/../y' });
+    assert.equal(r.body['sub'], 'app-car_race-consolerwxy');
+    // And an app name that squeezes down to nothing still yields a usable subject.
+    const bare = await appToken(rig, session['token'] as string, { database: 'car_race', app: '///' });
+    assert.equal(bare.body['sub'], 'app-car_race-app');
+  } finally {
+    stop(rig);
+  }
+});
+
+test('minting for a database the shard has never seen is refused', async () => {
+  // Where "only the owner creates databases" is actually enforced: RuleCtx is sync and has no
+  // storage, so the rule cannot refuse an undeclared database. This can.
+  const rig = await startServer({ admin: adminRecord(), databases: ['car_race'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await appToken(rig, session['token'] as string, { database: 'not_a_database' });
+    assert.equal(r.status, 400);
+    assert.match(String(r.body['error']), /no such database/);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a viewer cannot mint an app token, and neither can a caller with no token', async () => {
+  // Handing out a credential is the owner's act, exactly like POST /databases. A REAL viewer login,
+  // not a hand-shaped token: the thing being tested is the role gate, and a forged token would be
+  // refused by the signature check before ever reaching it.
+  const VIEWER = { email: 'viewer@example.com', password: 'a completely different one' };
+  const salt = randomBytes(32);
+  const rig = await startServer({
+    users: {
+      [OWNER.email]: { salt: randomBytes(32).toString('base64'), hash: '', params: SCRYPT, role: 'owner' },
+      [VIEWER.email]: { salt: salt.toString('base64'), hash: hashOf(VIEWER.password, salt), params: SCRYPT, role: 'viewer' },
+    },
+  });
+  try {
+    const { body: session } = await login(rig, VIEWER.email, VIEWER.password);
+    assert.equal(session['role'], 'viewer', 'the viewer really did log in');
+    assert.equal((await appToken(rig, session['token'] as string, { database: 'car_race' })).status, 401);
+    assert.equal((await appToken(rig, 'not-a-token', { database: 'car_race' })).status, 401);
+    assert.equal(
+      (await call(rig, '/app-token', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ database: 'car_race' }),
+      })).status,
+      401,
+      'no Authorization header at all',
+    );
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a request with no database named is a 400, not a token for nothing', async () => {
+  const rig = await startServer({ admin: adminRecord() });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    assert.equal((await appToken(rig, session['token'] as string, {})).status, 400);
+    assert.equal((await appToken(rig, session['token'] as string, { database: '' })).status, 400);
+  } finally {
+    stop(rig);
+  }
+});
+
+// ------------------------------------------------------------------ §5.22 Gate F-1: /wire-token
+
+/**
+ * The console's own wire credential, for ONE database.
+ *
+ * Unlike /app-token this is not the owner handing a database to somebody else — it is the console
+ * saying which database the operator is looking at right now, so a VIEWER may mint one. What it may
+ * not do is invent a database, or hand a credential to a caller with no console session.
+ */
+const wireToken = (rig: Rig, token: string | null, body: unknown) =>
+  call(rig, '/wire-token', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+    },
+    body: JSON.stringify(body),
+  });
+
+test('a console session mints a wire token for one database, keeping its own subject and role', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['car_race', 'chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await wireToken(rig, session['token'] as string, { database: 'chat' });
+    assert.equal(r.status, 201);
+    assert.equal(r.body['database'], 'chat');
+
+    const c = claims(r.body['token'] as string);
+    assert.equal(c['ns'], 'chat', 'the claim `server.ts` chooses the tenant from, at hello');
+    // The subject and the role are the SESSION's, and that is the whole point: §10 kicks by subject
+    // and every audit line names one, so a per-database subject would split both silently.
+    assert.equal(c['sub'], session['sub'], 'same subject as the session that asked');
+    assert.equal(c['role'], session['role'], 'and the same role — the console-exemption costs one');
+    assert.match(String(c['sub']), /^console-/);
+    assert.equal(signedWith(r.body['token'] as string, 'test-secret-for-console-auth'), true);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a viewer MAY mint a wire token — reading one database is what a viewer does', async () => {
+  // The difference from /app-token, stated as a test rather than left as a comment: that endpoint
+  // hands a credential to a third party and is the owner's act; this one moves the operator's own
+  // session onto one database. §5.9's `consoleWriteDenied` is what stops a viewer writing with it.
+  const VIEWER = { email: 'viewer@example.com', password: 'a completely different one' };
+  const salt = randomBytes(32);
+  const rig = await startServer({
+    databases: ['chat'],
+    users: {
+      [OWNER.email]: { salt: randomBytes(32).toString('base64'), hash: '', params: SCRYPT, role: 'owner' },
+      [VIEWER.email]: { salt: salt.toString('base64'), hash: hashOf(VIEWER.password, salt), params: SCRYPT, role: 'viewer' },
+    },
+  });
+  try {
+    const { body: session } = await login(rig, VIEWER.email, VIEWER.password);
+    assert.equal(session['role'], 'viewer', 'the viewer really did log in');
+    const r = await wireToken(rig, session['token'] as string, { database: 'chat' });
+    assert.equal(r.status, 201);
+    assert.equal(claims(r.body['token'] as string)['role'], 'viewer', 'minted AS a viewer, not upgraded');
+  } finally {
+    stop(rig);
+  }
+});
+
+test('no console session mints no wire token — tooth (a)', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'], shadowKey: 'a-shadow-key' });
+  try {
+    assert.equal((await wireToken(rig, null, { database: 'chat' })).status, 401, 'no Authorization header');
+    assert.equal((await wireToken(rig, 'not-a-token', { database: 'chat' })).status, 401, 'a forged one');
+    // And the shape that actually happened on this server once: a token signed with the SAME shard
+    // secret that carries no role. A device's shadow token is exactly that, and a subject prefix is
+    // not a credential — `consoleUser` demanding a KNOWN role is what refuses it.
+    const shadow = await call(rig, '/shadow-token', {
+      method: 'POST',
+      headers: { authorization: 'Bearer a-shadow-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ device: 'testdevice' }),
+    });
+    assert.equal(claims(shadow.body['token'] as string)['role'], undefined, 'really roleless');
+    assert.equal(
+      (await wireToken(rig, shadow.body['token'] as string, { database: 'chat' })).status,
+      401,
+      'signed with the shard secret, but roleless',
+    );
+  } finally {
+    stop(rig);
+  }
+});
+
+test('minting a wire token for an undeclared database is refused, and nothing is minted — tooth (b)', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await wireToken(rig, session['token'] as string, { database: 'not_a_database' });
+    assert.equal(r.status, 400);
+    assert.match(String(r.body['error']), /no such database/);
+    assert.equal('token' in r.body, false, 'and no credential came back with the refusal');
+    // The same refusal for a missing body, so "no database" cannot fall through to the default one.
+    assert.equal((await wireToken(rig, session['token'] as string, {})).status, 400);
+  } finally {
+    stop(rig);
+  }
+});
+
+// ----------------------------------------------------- §5.22 Gate F-3: DECLARED, never the union
+
+/**
+ * The seam Gate F opened and Gate D made expensive.
+ *
+ * `/topnodes` answers with declared UNION derived, because a sidebar must not hide a namespace an
+ * operator holds. Both mints were checking THAT list — so a name that exists only as DATA in the
+ * default tenant's schema passed, and since Gate D the gateway refuses an undeclared `ns` at hello.
+ * The token minted was one nobody could ever connect with: a 400 turned into a 4401 ten seconds
+ * later, and for /app-token the dead credential had already been handed to somebody else.
+ *
+ * `userstatus` is not a hypothetical. It is production's own top-level namespace today, written
+ * long before the registry existed, and it is exactly what the sidebar shows beside a real database.
+ */
+test('neither mint will name a database that only exists as DATA — tooth: check on declared', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'], raw: ['userstatus'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const token = session['token'] as string;
+
+    // The sidebar sees both — that is its job, and it is why the mints cannot use its list.
+    const sidebar = await call(rig, '/topnodes', { headers: { authorization: `Bearer ${token}` } });
+    assert.deepEqual(sidebar.body['names'], ['chat', 'userstatus'], 'both are top-level names');
+    assert.deepEqual(sidebar.body['declared'], ['chat'], 'only one is a database');
+
+    for (const [what, r] of [
+      ['wire', await wireToken(rig, token, { database: 'userstatus' })],
+      ['app', await appToken(rig, token, { database: 'userstatus', app: 'android' })],
+    ] as const) {
+      assert.equal(r.status, 400, `${what}: a raw namespace is not a database`);
+      assert.match(String(r.body['error']), /no such database/, what);
+      assert.equal('token' in r.body, false, `${what}: and nothing was minted`);
+    }
+
+    // The declared one still mints from both, so this is the registry and not a blanket refusal.
+    assert.equal((await wireToken(rig, token, { database: 'chat' })).status, 201);
+    assert.equal((await appToken(rig, token, { database: 'chat', app: 'android' })).status, 201);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a gateway that does not send `declared` mints nothing, rather than minting on the union', async () => {
+  // The rolling-deploy direction. An older gateway answers `/topnodes` with `names` only, so
+  // `declared` reads as empty and both mints refuse — a 400 the operator can read, rather than a
+  // token that fails at hello ten seconds later on a shard they cannot see.
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'] });
+  try {
+    rig.shard.declared = [] as unknown as string[];
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const r = await wireToken(rig, session['token'] as string, { database: 'chat' });
+    assert.equal(r.status, 400, 'fails closed, and says which way');
+    assert.match(String(r.body['error']), /no such database/);
+  } finally {
+    stop(rig);
+  }
+});
+
+// ------------------------------------------------------- §5.24 Gate B: GET /usage?db=
+
+/**
+ * One database's usage line. The shape is `/stats`': a FIXED list of queries, none of which a
+ * caller can name, influence or add to. The one thing a caller supplies is the database — and it
+ * is checked against the shard's REGISTRY before it is interpolated into anything, which is the
+ * whole reason a caller-supplied value is safe on this endpoint.
+ */
+const usage = (rig: Rig, token: string | null, db: string) =>
+  call(rig, `/usage?db=${encodeURIComponent(db)}`, {
+    headers: token === null ? {} : { authorization: `Bearer ${token}` },
+  });
+
+test('a console session reads one database\'s usage, and only declared names are answered', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'], raw: ['userstatus'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const token = session['token'] as string;
+
+    const ok = await usage(rig, token, 'chat');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body['database'], 'chat');
+    for (const line of ['connections', 'storageBytes', 'downloadsPerSec', 'load', 'quotaRejectedPerSec', 'shardLoad']) {
+      assert.ok(line in ok.body, `the tile's ${line} line is answered`);
+    }
+
+    // REGISTRY, not the union — same rule as the two mints (§5.22 Gate F-3). `userstatus` is a raw
+    // namespace of the default tenant: real data, never a database anyone was handed, and the panel
+    // bills per database. It is also what keeps a second shard's schemas out of the answer when two
+    // shards share one Postgres database, since `storageBytes` sizes every `nodes` relation it sees.
+    const raw = await usage(rig, token, 'userstatus');
+    assert.equal(raw.status, 400);
+    assert.match(String(raw.body['error']), /no such database/);
+    assert.equal('load' in raw.body, false, 'and no numbers came back with the refusal');
+
+    // A name that is nothing at all, and the one shape a query-string endpoint must not pass on.
+    assert.equal((await usage(rig, token, '')).status, 400);
+    assert.equal((await usage(rig, token, 'chat"} or rtdb_connections{')).status, 400, 'not a selector');
+  } finally {
+    stop(rig);
+  }
+});
+
+test('usage is not readable without a console session', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'], shadowKey: 'a-shadow-key' });
+  try {
+    assert.equal((await usage(rig, null, 'chat')).status, 401, 'no Authorization header');
+    assert.equal((await usage(rig, 'not-a-token', 'chat')).status, 401, 'a forged one');
+    // And the shape that has caught this server before: signed with the same shard secret, no role.
+    const shadow = await call(rig, '/shadow-token', {
+      method: 'POST',
+      headers: { authorization: 'Bearer a-shadow-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ device: 'testdevice' }),
+    });
+    assert.equal((await usage(rig, shadow.body['token'] as string, 'chat')).status, 401, 'signed, but roleless');
+  } finally {
+    stop(rig);
+  }
+});
+
+// -------------------------------------------------- §5.24 Gate C: the default tenant, and overrides
+
+test('the DEFAULT tenant gets a tile, and it is the one holding all the data today', async () => {
+  // `currentDb` is null on the default tenant — a connection there carries no `ns` to name it by —
+  // and `/usage` refused it, so the ONE database with production's entire dataset was the only one
+  // with no usage line. It is not in the registry and never will be: it is the schema the gateway
+  // was configured with, not something anyone declared.
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'], raw: ['userstatus'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const token = session['token'] as string;
+
+    const sidebar = await call(rig, '/topnodes', { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(sidebar.body['defaultDb'], 'public', 'the gateway says which database it serves');
+
+    const ok = await usage(rig, token, 'public');
+    assert.equal(ok.status, 200, 'the default tenant is readable');
+    assert.equal(ok.body['database'], 'public');
+
+    // And nothing else got in with it: a raw namespace is still not a database.
+    assert.equal((await usage(rig, token, 'userstatus')).status, 400);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a database can be declared WITH a quota, and the number is bounded at the door', async () => {
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const token = session['token'] as string;
+    const declare = (body: unknown) =>
+      call(rig, '/databases', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+
+    assert.equal((await declare({ name: 'with_quota', quotaAcqPerSec: 120 })).status, 201);
+    assert.equal((await declare({ name: 'no_quota' })).status, 201, 'omitted stays optional');
+
+    // A zero would be a database that can never write, and no door here can say "I meant that".
+    for (const bad of [0, -5, 1.5, '64', 999_999]) {
+      const r = await declare({ name: 'bad_quota', quotaAcqPerSec: bad });
+      assert.equal(r.status, 400, `quota ${JSON.stringify(bad)} is refused`);
+    }
+  } finally {
+    stop(rig);
+  }
+});
+
+test('a database just created is in the sidebar AT ONCE, not after the cache window', async () => {
+  /**
+   * §5.24 Gate D, and this test exists because its absence was PROVEN: the mentor reverted the
+   * cache-invalidation fix and the whole file stayed green. `declareDatabase` invalidates
+   * `topCache` so the operator who just clicked `+` is not told for ten seconds that their database
+   * does not exist — the obvious conclusion being that the button is broken.
+   *
+   * It went silently dead at §5.22 F-3, which renamed the cache from `{ names }` to `{ shard }`:
+   * the invalidation kept writing a `names` key that nothing reads any more, and `topCache.shard`
+   * stayed warm. Two lines, forty apart, with nothing tying them together — so this ties them.
+   *
+   * The window is REAL time, not mocked: `TOPNODES_TTL` is 10s and this asserts within
+   * milliseconds, so a stale cache cannot pass by the test being slow.
+   */
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const token = session['token'] as string;
+    const list = async (): Promise<string[]> =>
+      ((await call(rig, '/topnodes', { headers: { authorization: `Bearer ${token}` } })).body['declared'] as string[]);
+
+    // WARM the cache first — an invalidation that is never needed cannot be shown to work.
+    assert.deepEqual(await list(), ['chat'], 'the sidebar has been read, so the cache is populated');
+
+    const created = await call(rig, '/databases', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'brand_new' }),
+    });
+    assert.equal(created.status, 201);
+
+    assert.deepEqual(
+      (await list()).sort(),
+      ['brand_new', 'chat'],
+      'the new database is there immediately — a cache that outlives its own creation reads as a broken + button',
+    );
+  } finally {
+    stop(rig);
+  }
+});
+
+test('the served page points at the SAME endpoint the CSP allows (§5.25 Gate 4)', async () => {
+  /**
+   * Two facts that had to agree and did not have to be written down together: the `connect-src`
+   * origin in the CSP header, and the value in the page's endpoint box. When they differ the
+   * browser refuses the socket BEFORE a byte leaves — the page says "connecting" and nothing else,
+   * with no line in the auth-server's log or the gateway's. It cost a rehearsal at §5.24 Gate B and
+   * the first riding-client run at §5.25 Gate 1.
+   *
+   * Asserted against a NON-DEFAULT origin, so a page that simply kept its own default would pass
+   * the equality and fail this.
+   */
+  const rig = await startServer({ admin: adminRecord(), wss: 'wss://rtdb.example.test' });
+  try {
+    const r = await fetch(`http://127.0.0.1:${rig.port}/`);
+    const html = await r.text();
+    const csp = r.headers.get('content-security-policy') ?? '';
+    assert.match(csp, /connect-src wss:\/\/rtdb\.example\.test 'self'/, 'the CSP allows the configured origin');
+    assert.match(html, /<input name="url" value="wss:\/\/rtdb\.example\.test"/, 'and the box is filled with it');
+    assert.doesNotMatch(html, /value="ws:\/\/127\.0\.0\.1:8080"/, 'the file:// default is gone from the SERVED page');
+
+    // And the property behind both, stated once: whatever the box says must be inside the CSP.
+    const boxed = /<input name="url" value="([^"]+)"/.exec(html)?.[1] as string;
+    assert.ok(csp.includes(`connect-src ${boxed} `), `the box (${boxed}) must be an allowed origin`);
+  } finally {
+    stop(rig);
+  }
+});
+
+test('opened as a FILE the page still carries the local default', () => {
+  // The served page is rewritten; the file on disk is not. `file://` has no server to ask, and a
+  // local gateway is the right guess for the one mode where somebody pastes their own token.
+  const html = readFileSync(fileURLToPath(new URL('../../console/rtdb-console.html', import.meta.url)), 'utf8');
+  assert.match(html, /<input name="url" value="ws:\/\/127\.0\.0\.1:8080"/);
+});
+
+test('a name that would not be a legal SCHEMA is refused at declare, not at hello (§5.26)', async () => {
+  /**
+   * The whole point of moving the rule: `LightingMacQueen` used to pass `/databases` and fail three
+   * steps later at the tenant factory — 1011 on a hello, with a registry row nobody can delete,
+   * because §5.19 gave declaring no inverse on purpose.
+   */
+  const rig = await startServer({ admin: adminRecord(), databases: ['chat'] });
+  try {
+    const { body: session } = await login(rig, OWNER.email, OWNER.password);
+    const declare = (name: string) =>
+      call(rig, '/databases', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${session['token'] as string}` },
+        body: JSON.stringify({ name }),
+      });
+
+    // §5.27: and the reason survives the auth-server's pass-through — the console alerts `error`
+    // verbatim, so "which rule" has to arrive here, not just 400.
+    const bad: [string, RegExp][] = [
+      ['LightingMacQueen', /lowercase letters/],
+      ['Car_Race', /lowercase letters/],
+      ['car-race', /lowercase letters/],
+      ['9lives', /lowercase letters/],
+      ['a'.repeat(52), /at most 51/],
+      // §5.29: the empty name too. It used to be answered by the auth-server's own
+      // `{"error":"name required"}` (`auth-server.mjs:822`) — the one reason of the four that did
+      // not come from `path.ts`, in the file whose own comment says the rule must not live there.
+      //
+      // The pattern needs BOTH words: a bare /required/ matches `name required` just as happily as
+      // `database name is required`, so it would have passed against the very code this case
+      // exists to keep deleted. `/database name.*required/` keys on the gateway's voice while
+      // staying loose about how the sentence is worded.
+      ['', /database name.*required/],
+    ];
+    for (const [name, reason] of bad) {
+      const r = await declare(name);
+      assert.equal(r.status, 400, `${name} is refused at the door`);
+      assert.match(String(r.body['error']), reason, name);
+    }
+    // And the legal shape still declares — the rule refuses characters, not names.
+    assert.equal((await declare('lightingmacqueen')).status, 201);
+    assert.equal((await declare('car_race')).status, 201);
+  } finally {
+    stop(rig);
+  }
 });

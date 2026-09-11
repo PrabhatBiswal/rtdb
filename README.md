@@ -17,7 +17,7 @@ compare-and-swap for contended values, and horizontal fanout across more than on
 ### What Firebase has that this does not
 
 "Mostly mechanical" is a claim about call sites, not about coverage. These are the gaps a port hits,
-as of protocol v1.5:
+as of protocol v1.6:
 
 | Firebase | Here |
 |---|---|
@@ -55,6 +55,22 @@ That screenshot is a local run: `ws://127.0.0.1:8080`, six seeded paths, and the
 reading `unavailable` because it discovers gateways through Prometheus, which a local run does not
 have. Everything else works without it.
 
+### Per-database usage
+
+![The console's usage tile for one database: connections, storage, downloads, load and quota, each
+with a caption naming what it does and does not measure](console/usage-panel.png)
+
+One database at a time — the one the console is connected to, because a socket belongs to one
+database for its whole life. The captions are the point. **Downloads is measured before TLS**: the
+gateway counts what it hands the load balancer, TLS and TCP happen beyond it, and the egress bill is
+1.0–1.3× the number shown depending on traffic shape. **Storage is live data only** — history is
+retention, and billing it would charge you for our durability window. **Connections includes the
+console itself**, because it is a connection. **Load** is the database's share of the shard's write
+lock, and **quota** says whether the limit is the shard's default or one set for this database.
+
+What it does not cover is written on it: writes and storage are isolated per database, fanout CPU is
+not — that one is per gateway and does not divide by database.
+
 ---
 
 ## What's in here
@@ -69,8 +85,8 @@ infrastructure, and the tests that hold it together.
 | **`sdk-android/`** | Android bindings — main-thread callbacks, background ping cadence, reconnect driven by `ConnectivityManager` — plus **a working demo app**. |
 | **`console/`** | **A web admin console.** Sign in, browse and edit the live tree, manage users with owner/editor/viewer roles, reset passwords, read the audit log. Served by a small auth server that mints short-lived tokens. |
 | **`deploy/`** | Terraform for the whole footprint: gateways behind a network load balancer, Postgres, Redis, container registries, and a Prometheus + Grafana host with dashboards. |
-| **`PROTOCOL.md`** | The wire protocol, frozen at v1.5 — frames, the reconnect contract, and the semantics every SDK must implement. Enough to write your own client against. |
-| **`test/`, `harness/`** | 230 tests, including **a chaos suite that kills the server during live traffic** (below). |
+| **`PROTOCOL.md`** | The wire protocol, frozen at v1.6 — frames, the reconnect contract, and the semantics every SDK must implement. Enough to write your own client against. |
+| **`test/`, `harness/`** | 324 tests plus an eleven-scenario chaos suite that **kills the server during live traffic** (below). |
 | **`scripts/`** | Operator tools: a load rig that drives thousands of connections from forked workers, token minting, a Postgres wait-event sampler, and a harness that measures the commit cycle under fanout load. |
 
 ### The chaos suite is the part worth looking at
@@ -165,6 +181,7 @@ default secret that is public knowledge (it is in this repo). Fine locally, neve
 
 ```bash
 export RTDB_DEV_SECRET="$(openssl rand -hex 32)"   # required — see Authentication
+export RTDB_RULES=rules/own-subtree.ts             # required with Postgres — the gateway refuses to boot without a rules module
 export RTDB_STORAGE=postgres
 export RTDB_PG_URL="postgres://user:pass@host:5432/rtdb"
 export RTDB_PORT=8080
@@ -195,6 +212,7 @@ Without Redis a single gateway is fully correct; it just cannot tell a second on
 | `RTDB_REDIS_URL` | off | Enables cross-gateway fanout. Unreachable at boot is a boot failure, never a silent island. |
 | `RTDB_SHARD` | `0` | Lets several independent shards share one Redis |
 | `RTDB_DEV_SECRET` | — | HMAC secret for token verification. **Required with Postgres.** |
+| `RTDB_RULES` | off (`allowAll`) | Path to a rules module, resolved against the working directory. **Required with Postgres**; see [Authentication](#authentication). |
 | `RTDB_PRUNE_MS` | off | History retention sweep interval (Postgres only) |
 | `RTDB_LOCK_TTL_MS` | `3000` | Leader-election lock TTL for the fanout dispatcher |
 | `RTDB_PERSIST` | off | File path for memory storage to persist to |

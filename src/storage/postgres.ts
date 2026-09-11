@@ -2,7 +2,14 @@ import { randomInt } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import pg from 'pg';
 import { DEFAULT_LIMITS, type Limits } from '../protocol/limits.ts';
-import { ancestorsInclusive, isRelevant, joinPath } from '../protocol/path.ts';
+import {
+  ancestorsInclusive,
+  isRelevant,
+  joinPath,
+  MAX_DATABASE_NAME,
+  SCHEMA_NAME,
+  validateDatabaseName,
+} from '../protocol/path.ts';
 import type { Json } from '../protocol/frames.ts';
 import type {
   AckResult,
@@ -18,12 +25,187 @@ import { flatten, type Leaf, unflatten } from './tree.ts';
 
 const SCHEMA_SQL = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 
+/**
+ * §5.22 Gate A: the shard's CONTROL schema — the one schema that belongs to no tenant.
+ *
+ * `rtdb_control` and not `public`, because production's tenant schema IS `public` today and a
+ * control schema that lands there would make this gate a no-op exactly where it matters. Not `rtdb`
+ * either: once Gate D derives a tenant's schema from its client-visible database name, a plausible
+ * name has to be unable to collide with this one, and the `rtdb_` prefix plus a word no product
+ * surface uses is what buys that. The constructor refuses a tenant schema equal to it, so the
+ * collision is closed by construction rather than by hoping the derivation stays prefixed.
+ */
+export const DEFAULT_CONTROL_SCHEMA = 'rtdb_control';
+
+/**
+ * §5.22 Gate B: the search_path a pooled connection carries when NO transaction has claimed it.
+ *
+ * It names a schema that is never created, and that is the entire footgun defence. A shared pool
+ * means a connection outlives the tenant that last borrowed it, so a transaction that forgot to set
+ * its own search_path would write into whoever held the connection before it — silently, and
+ * across tenants. Measured, both arms: with the pool defaulting to a real tenant's schema the
+ * forgotten `SET` returned "ok" and the row landed in the previous tenant's table; with the pool
+ * defaulting HERE it fails at the first unqualified relation with `relation "…" does not exist`.
+ *
+ * This is why the fix is not an assert. An assert has the same failure mode as the thing it guards
+ * — it must be remembered in every transaction. This has to be remembered once, in one place, and
+ * it turns the leak into an error inside the offending transaction.
+ */
+export const NO_TENANT_SCHEMA = 'rtdb_no_tenant';
+
+/**
+ * §5.22 Gate B: the ONE place a pool for this adapter is built, and it is exported so that the pool
+ * an adapter makes for itself and the pool Gate D shares between N tenants are the same object,
+ * built the same way. Two constructions would be two behaviours, and only one of them would be the
+ * one under test.
+ */
+export const createPool = (url: string, max = 10): pg.Pool =>
+  new pg.Pool({
+    connectionString: url,
+    max,
+    /**
+     * §5.11 Gate B. Unset, pg-pool skips its timeout branch entirely (`pg-pool/index.js:206`) and
+     * a waiter queues FOREVER — so an exhausted pool did not slow the gateway down, it hung it,
+     * with no error for any layer above to act on. With it, the wait rejects at `:225` and the
+     * containment built in Gate A takes over: a write retries then abandons with a log line, a
+     * listen repairs via §3 resync, and the connection stays up.
+     *
+     * 500ms, and all three bounds are measured:
+     *  - FLOOR (measured): pool acquisition p99 is 0.143ms at 500 concurrent listens locally,
+     *    worst single acquisition 8.3ms. 500ms is ~3,500x that p99 — healthy traffic cannot reach
+     *    it, even allowing an order of magnitude for RDS holding connections longer than a local
+     *    server does.
+     *  - CEILING: healthz's own probe budget is 2000ms (`metrics.ts`). Going above it would make
+     *    this dead weight — a wait that long fails the health check and the NLB pulls the gateway
+     *    before the timeout could matter.
+     *  - PRODUCT (§5.11 Gate A): the write path retries 3 times inside the serial commit chain, so
+     *    the head-of-line stall is ~3 x (timeout + spacing) — about 1.6s here, against ~6.1s if
+     *    this were 2000ms. The user approved Gate B having seen that arithmetic.
+     */
+    connectionTimeoutMillis: 500,
+    /**
+     * §5.22 Gate B: NOT this tenant's schema, which is what it used to be (`-c search_path=<schema>`)
+     * and which was the whole reason the budget was `10 x N` — a connection was bound to a tenant
+     * before it was ever borrowed. It now names nothing, and every transaction claims the
+     * connection for itself with `SET LOCAL`. See `NO_TENANT_SCHEMA`.
+     */
+    options: `-c search_path=${NO_TENANT_SCHEMA}`,
+      });
+
+/**
+ * §5.22 Gate B / §5.21's `P >= N + reads + 1`, as code rather than as a number somebody remembers.
+ *
+ * The two terms are different KINDS and sizing them alike is the mistake this exists to prevent:
+ *
+ *  - `tenants` is a STRUCTURAL FLOOR. Each tenant's `WritePipeline` serializes onto its own chain
+ *    (`write.ts` `#chain`), and a chain holds one connection for the whole of its transaction. Below
+ *    N, tenants demonstrably queue on each other — which is the cross-tenant coupling Phase 3 exists
+ *    to remove, moved from the `rev_counter` row to the pool, and invisible because a pool wait
+ *    looks like a slow commit rather than a refusal.
+ *  - `reads` is QUEUEING HEADROOM. The pool-level reads are single statements with no transaction,
+ *    so they need enough connections for concurrent demand, not one per tenant.
+ *
+ * The `+ 1` is the listen client's slot, kept so a shard sized to the floor still has one to spare.
+ */
+export const sharedPoolSize = (tenants: number, reads = 4): number => tenants + reads + 1;
+
+/**
+ * One `remove` handler per POOL, however many adapters share it.
+ *
+ * Gate B let N tenants share a pool, and each of them was doing `pool.on('remove', …)` in its own
+ * constructor. Two defects, both measured on 14 tenants over one pool: Node warns at the eleventh
+ * (`MaxListenersExceededWarning`, because an EventEmitter is being used as a fan-out registry), and
+ * `close()` never detached, so under Gate D a tenant that comes and goes leaves its handler on a
+ * pool that outlives it — a real leak, not just a noisy one.
+ *
+ * The handler itself is still needed: Postgres reuses backend PIDs, so a dead connection's PID must
+ * be forgotten by every adapter or a stale one silently swallows a real notification from another
+ * gateway. What changes is that the pool carries ONE handler that fans out to a set, and each
+ * adapter holds only its own membership — which it can then give back.
+ */
+const pidForgetters = new WeakMap<pg.Pool, Set<(pid: number) => void>>();
+
+/**
+ * Built HERE, in a function whose only local is the set, and the placement IS the fix.
+ *
+ * V8 gives every closure created in one invocation a SHARED context holding that invocation's
+ * variables. Written inline inside `forgetPidsOnRemove`, the pool's long-lived `remove` handler and
+ * the short-lived unhook it returns share one context — so the handler, which lives as long as the
+ * pool, transitively pins the FIRST adapter's `forget` and through it that adapter, for the pool's
+ * whole life. That adapter's own `close()` cannot undo it: the reference is not in the set, it is in
+ * the context the handler carries, and nothing in the set's API can reach it.
+ *
+ * Measured, `WeakRef` + `gc()` over 14 adapters on one pool: inline, 1 of 14 survives and it is
+ * ALWAYS index 0 — at n=1, n=3 and n=14, and whichever order they are closed in. Hoisted here, 0 of
+ * 14. One adapter rather than N, so it is bounded — and still a promise `close()` was not keeping.
+ * Under Gate D it means the first tenant to touch a gateway's pool is never collected.
+ */
+const fanOutRemove =
+  (subscribers: Set<(pid: number) => void>) =>
+  (c: pg.PoolClient): void => {
+    const pid = (c as TrackedClient)[BACKEND_PID];
+    if (pid !== undefined) for (const forget of subscribers) forget(pid);
+  };
+
+function forgetPidsOnRemove(pool: pg.Pool, forget: (pid: number) => void): () => void {
+  let set = pidForgetters.get(pool);
+  if (!set) {
+    set = new Set<(pid: number) => void>();
+    pidForgetters.set(pool, set);
+    pool.on('remove', fanOutRemove(set));
+  }
+  const subscribers = set;
+  subscribers.add(forget);
+  return () => void subscribers.delete(forget);
+}
+
+/**
+ * The registry, and it is the only DDL in this file rather than in `schema.sql` for one reason:
+ * `schema.sql` is applied through the connection's `search_path` and is therefore a TENANT's
+ * schema, statement for statement. This table is not a tenant's — every tenant on the shard reads
+ * it and the console writes it — so it is qualified explicitly and does not care what the
+ * search_path says. Keeping it in the file would have meant interpolating a schema name into the
+ * file, which stops it being SQL you can run.
+ *
+ * §5.19's reasoning is unchanged and still the point: a database used to be a side-effect of data
+ * (whatever path was written first), which meant a client could not hand an empty one to a team, a
+ * team could delete itself out of existence, and a usage panel had no row to draw for a database
+ * holding nothing. `topNodes` unions this with the derived list, so declaring stays additive.
+ */
+const CONTROL_SQL = (control: string): string => `
+CREATE TABLE IF NOT EXISTS ${control}.databases (
+  name       TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by TEXT        NOT NULL
+)`;
+
+/**
+ * §5.24 Gate C: the per-database quota override, added SEPARATELY from the table above.
+ *
+ * `ADD COLUMN IF NOT EXISTS` and not a new column in `CONTROL_SQL`, because `CREATE TABLE IF NOT
+ * EXISTS` does nothing at all to a table that already exists — a shard that has been declaring
+ * databases since §5.19 would never grow the column, and the override would silently be null
+ * forever on precisely the deployments that have data. Idempotent, so every boot is safe.
+ *
+ * NULL means "the shard default" (§5.23's `QUOTA_ACQ_PER_SEC`), which is a different statement from
+ * any number: it says nobody has decided for this database, so it follows the shard when the shard
+ * changes. A column defaulted to 64 would freeze today's number into every row.
+ */
+const CONTROL_QUOTA_SQL = (control: string): string =>
+  `ALTER TABLE ${control}.databases ADD COLUMN IF NOT EXISTS quota_acq_per_sec INTEGER`;
+
 /** `oplog.op` is a SMALLINT (§8); these two values are the whole mapping. */
 export const OP_CODE = { put: 0, merge: 1 } as const;
 
 const OP_NAME = ['put', 'merge'] as const satisfies readonly WriteOp[];
 
-const OPLOG_COLUMNS = 'SELECT rev, path, op, value, write_id, ts FROM oplog';
+/**
+ * §5.22 Gate B: a function of the tenant, because both call sites are POOL-LEVEL reads — outside
+ * any transaction, so outside the one place `SET LOCAL search_path` runs. The statements inside
+ * `#tx` stay unqualified on purpose: the preamble has already claimed that connection.
+ */
+const oplogColumns = (tenant: string): string =>
+  `SELECT rev, path, op, value, write_id, ts FROM ${tenant}.oplog`;
 
 interface OplogRowDb {
   rev: string;
@@ -148,17 +330,20 @@ export const RELEVANT_SQL = `(path = ANY($2::text[]) OR path LIKE $3 ESCAPE '\\'
  * re-creates a cycle, this returns a truncated list instead of pinning a core forever — a bad answer
  * beats no answer, and a hung backend on the production shard is what it cost to learn that.
  */
-export const TOPNODES_SQL = `
+export const topNodesSql = (control: string, tenant: string): string => `
 WITH RECURSIVE ns AS (
   SELECT 1 AS depth,
-         (SELECT split_part(path, '/', 1) FROM nodes ORDER BY path USING ~<~ LIMIT 1) AS name
+         (SELECT split_part(path, '/', 1) FROM ${tenant}.nodes ORDER BY path USING ~<~ LIMIT 1) AS name
   UNION ALL
   SELECT ns.depth + 1,
-         (SELECT split_part(n.path, '/', 1) FROM nodes n
+         (SELECT split_part(n.path, '/', 1) FROM ${tenant}.nodes n
            WHERE n.path ~>=~ (ns.name || '0') ORDER BY n.path USING ~<~ LIMIT 1)
     FROM ns WHERE ns.name IS NOT NULL AND ns.depth < 5000
 )
-SELECT name FROM ns WHERE name IS NOT NULL ORDER BY name`;
+SELECT name FROM ns WHERE name IS NOT NULL
+UNION
+SELECT name FROM ${control}.databases
+ORDER BY name`;
 
 /** Leaves of a subtree as `{path, value}`, ready for `unflatten`. One consistent read per call site. */
 const LEAVES = (col: string): string =>
@@ -173,7 +358,186 @@ export interface PostgresOptions {
    * so one database can host many independent stores (WP4 Gate A isolation).
    */
   schema?: string;
+  /**
+   * §5.22 Gate A: the schema holding the `databases` registry — ONE per shard, shared by every
+   * tenant on it. Defaults to `DEFAULT_CONTROL_SCHEMA`, which is what makes Gate D right by
+   * default: N adapters constructed without thinking about it still share one registry, rather
+   * than each growing a private copy that nothing would notice.
+   */
+  controlSchema?: string;
+  /**
+   * §5.22 Gate B: a pool to BORROW rather than create. Given one, this adapter never ends it — the
+   * owner does — which is what lets N tenants share the connections that used to be `10 x N`.
+   * Its default `search_path` must be `NO_TENANT_SCHEMA`; `sharedPoolSize` sizes it.
+   *
+   * Unset, the adapter makes its own, exactly as it always has. That is what keeps the 38 test
+   * files and today's single-tenant deployment unchanged.
+   */
+  pool?: pg.Pool;
+  /**
+   * §5.22 Gate C: a `LISTEN` connection to SHARE rather than open. One client carries every
+   * tenant's channel, so N tenants cost one connection here instead of N. Given one, this adapter
+   * never closes it — the owner does; it only stops listening to its own channel.
+   */
+  listener?: CommitListener;
   poolMax?: number;
+}
+
+
+const COMMIT_CHANNEL_PREFIX = 'rtdb_commit_';
+
+/**
+ * Postgres truncates an identifier at 63 BYTES, and it does it with a NOTICE rather than an error —
+ * so two channels that differ only past byte 63 are one channel, and nothing says so.
+ *
+ * That is not a curiosity here, it is this gate's own defect coming back: two tenant schemas sharing
+ * their first 51 characters would `LISTEN`/`NOTIFY` on the same truncated name and cross-wake each
+ * other exactly as the unqualified `rtdb_commit` did. Measured — `LISTEN <64 chars ending x>` then
+ * `NOTIFY <same 63 chars ending y>` delivers, and the notification names the 63-byte form.
+ *
+ * The bound therefore belongs on the SCHEMA NAME, in the constructor's existing guard, derived from
+ * this prefix rather than written as 51. Two rules that must agree and are written separately are
+ * two rules that will disagree.
+ */
+/**
+ * §5.26: re-exported from `path.ts`, where the database-name rule now lives, so the two cannot
+ * drift. They already had: a name this file refused was one `validateDatabaseName` accepted, and
+ * the disagreement surfaced as a 1011 at hello with an undeletable registry row behind it.
+ */
+export const MAX_SCHEMA_NAME = MAX_DATABASE_NAME;
+
+/** §5.22 Gate C: the channel a tenant's commits are announced on. One per tenant schema. */
+export const commitChannel = (tenant: string): string => `${COMMIT_CHANNEL_PREFIX}${tenant}`;
+
+/**
+ * §5.22 Gate C: ONE `LISTEN` connection carrying every tenant's channel.
+ *
+ * The channel used to be the literal `rtdb_commit`, and LISTEN/NOTIFY in Postgres is scoped to the
+ * DATABASE, not the schema — so with one schema per tenant every commit woke every OTHER tenant's
+ * dispatcher, each wake costing one `readOplogSince` that returns nothing. Measured before this
+ * gate: 5 commits in schema A produced 5 wake-ups in schema B while B's oplog was empty. O(N)
+ * amplification on the hot write path of a shard already at 96% of its lock ceiling.
+ *
+ * Qualifying the channel kills that, and it kills the OTHER half at the same time: one client can
+ * hold N channels, so N tenants no longer need N dedicated connections. That single edit is the
+ * reason `(f)` came out SCHEMA — it was the one place the database branch was winning.
+ *
+ * RECONNECTION IS PART OF THIS GATE, and it is the note that used to sit on `#listen` saying a
+ * dropped connection was not re-established. That was affordable when a dropped connection blinded
+ * ONE dispatcher in a deployment where the local listeners carried every wake-up anyway. One client
+ * carrying N tenants blinds N of them, and past Gate D there is a second gateway whose commits only
+ * ever arrive this way.
+ *
+ * On reconnect every channel is poked once, unconditionally: notifications raised during the gap are
+ * gone, and a poke is cheap (one oplog read that usually returns nothing) where a missed commit is
+ * a subscription that never converges.
+ */
+export class CommitListener {
+  #client: pg.Client | null = null;
+  #channels = new Map<string, Set<(pid: number) => void>>();
+  #starting: Promise<void> | null = null;
+  #retry: NodeJS.Timeout | null = null;
+  #stopped = false;
+
+  constructor(
+    private readonly url: string,
+    /** Reconnect spacing. Fixed, not backed off: this is a poke channel, not a load-bearing query. */
+    private readonly retryMs = 500,
+    /**
+     * `application_name`, so this connection says what it is in `pg_stat_activity`. It is one
+     * long-lived connection per gateway that runs no queries after its LISTENs, which is exactly
+     * what an idle-connection hunt kills first — and the operator deciding that has nothing else to
+     * go on. Tests use it to terminate THIS listener's backend and no other.
+     */
+    private readonly appName = 'rtdb-commit-listener',
+  ) {}
+
+  /** Subscribe to one tenant's channel. Returns the unsubscribe. */
+  async listen(channel: string, onCommit: (pid: number) => void): Promise<() => void> {
+    let subs = this.#channels.get(channel);
+    if (!subs) {
+      subs = new Set();
+      this.#channels.set(channel, subs);
+    }
+    subs.add(onCommit);
+    await this.#ensure();
+    // A client that is already up has not heard of this channel yet; one that is coming up will
+    // pick it up in `#attach`. Both paths, because `#ensure` resolves either way.
+    await this.#client?.query(`LISTEN ${channel}`).catch(() => undefined);
+    return () => {
+      subs?.delete(onCommit);
+      if (subs?.size === 0) {
+        this.#channels.delete(channel);
+        void this.#client?.query(`UNLISTEN ${channel}`).catch(() => undefined);
+      }
+    };
+  }
+
+  async close(): Promise<void> {
+    this.#stopped = true;
+    if (this.#retry) clearTimeout(this.#retry);
+    this.#retry = null;
+    this.#channels.clear();
+    const c = this.#client;
+    this.#client = null;
+    await c?.end().catch(() => undefined);
+    // And whatever was mid-connect: `#attach` checks `#stopped` after its own await, so joining
+    // here is what makes `close()` mean "no connection of mine is open when this resolves".
+    await this.#starting?.catch(() => undefined);
+  }
+
+  #ensure(): Promise<void> {
+    if (this.#stopped || this.#client) return Promise.resolve();
+    return (this.#starting ??= this.#attach().finally(() => {
+      this.#starting = null;
+    }));
+  }
+
+  async #attach(): Promise<void> {
+    if (this.#stopped) return;
+    const c = new pg.Client({ connectionString: this.url, application_name: this.appName });
+    // A dead poke connection must never take the process with it — and `error` is also how a
+    // connection that dies while idle announces itself, which is what arms the reconnect.
+    c.on('error', () => this.#reattach(c));
+    c.on('end', () => this.#reattach(c));
+    c.on('notification', (msg) => {
+      for (const cb of this.#channels.get(msg.channel) ?? []) cb(msg.processId);
+    });
+    try {
+      await c.connect();
+      // `close()` can land INSIDE that await, and when it does it sees `#client` still null and
+      // ends nothing — so this connection would survive its own listener and hold the process open.
+      // A test file whose every subtest passed and whose FILE then timed out is what that looks
+      // like from the outside; there is no error anywhere.
+      if (this.#stopped) return void (await c.end().catch(() => undefined));
+      this.#client = c;
+      for (const channel of this.#channels.keys()) await c.query(`LISTEN ${channel}`);
+    } catch {
+      this.#client = null;
+      await c.end().catch(() => undefined); // a half-open client is still a handle
+      this.#schedule();
+    }
+  }
+
+  #reattach(dead: pg.Client): void {
+    if (this.#client !== dead) return; // an old client's death event, already replaced
+    this.#client = null;
+    this.#schedule();
+  }
+
+  #schedule(): void {
+    if (this.#stopped || this.#retry) return;
+    this.#retry = setTimeout(() => {
+      this.#retry = null;
+      void this.#ensure().then(() => {
+        // The gap swallowed every notification raised inside it. Poke everyone once rather than
+        // reason about what was missed: the dispatcher re-reads the oplog, so a spurious poke costs
+        // one query and a missed one costs a subscription that never converges.
+        if (this.#client) for (const subs of this.#channels.values()) for (const cb of subs) cb(-1);
+      });
+    }, this.retryMs);
+    this.#retry.unref();
+  }
 }
 
 /**
@@ -186,7 +550,10 @@ export interface PostgresOptions {
  */
 export class PostgresStorage implements StorageAdapter {
   readonly #pool: pg.Pool;
+  /** True only for a pool this adapter made. A borrowed one outlives us and must not be ended. */
+  readonly #ownsPool: boolean;
   readonly #schema: string;
+  readonly #control: string;
   /** Gate B's commitGroup flattens with these (§9). */
   readonly #limits: Limits;
   /** Resolves to the epoch; also the "schema is applied" latch. Every public method awaits it. */
@@ -208,47 +575,46 @@ export class PostgresStorage implements StorageAdapter {
    * is the ruling (WORKLOAD §4).
    */
   readonly #ownPids = new Set<number>();
-  #listenClient: pg.Client | null = null;
+  readonly #listener: CommitListener;
+  /** True only for a listener this adapter made. A borrowed one outlives us. */
+  readonly #ownsListener: boolean;
+  /** Stops this adapter's channel subscription. Null until `onCommit` first wires it. */
+  #unlisten: (() => void) | null = null;
+  /** Set by `close()`. A subscription that resolves after it must not be kept. */
+  #closed = false;
+  /** Detaches this adapter from the pool's shared `remove` fan-out. */
+  readonly #unhookPool: () => void;
 
   constructor(opts: PostgresOptions) {
     this.#url = opts.url;
     this.#schema = opts.schema ?? 'public';
-    if (!/^[a-z_][a-z0-9_]*$/.test(this.#schema)) {
-      // The schema name is interpolated into DDL; nothing but an identifier may reach that string.
-      throw new Error(`illegal schema name: ${this.#schema}`);
+    this.#control = opts.controlSchema ?? DEFAULT_CONTROL_SCHEMA;
+    // The schema names are interpolated into DDL; nothing but an identifier may reach those
+    // strings. This same guard is what makes the schema-qualified `databases` reference in
+    // `topNodesSql` safe — one check, not a second one beside it.
+    // §5.22 Gate C added the LENGTH half to this same guard rather than beside it: the schema name
+    // becomes a NOTIFY channel, Postgres truncates identifiers at 63 bytes silently, and two schemas
+    // sharing a long enough prefix would land on one channel and cross-wake — the very defect this
+    // phase removed. `MAX_SCHEMA_NAME` derives from the channel prefix; nobody writes 51.
+    for (const [what, name] of [['schema', this.#schema], ['control schema', this.#control]] as const) {
+      if (!SCHEMA_NAME.test(name) || name.length > MAX_SCHEMA_NAME) {
+        throw new Error(`illegal ${what} name: ${name}`);
+      }
+    }
+    // A tenant schema that IS the control schema puts the list of all tenants back inside one of
+    // them — the exact shape Gate A exists to undo — and it would do it silently.
+    if (this.#schema === this.#control) {
+      throw new Error(`schema ${this.#schema} is the control schema; a tenant may not own it`);
     }
     this.#limits = opts.limits ?? DEFAULT_LIMITS;
-    this.#pool = new pg.Pool({
-      connectionString: opts.url,
-      max: opts.poolMax ?? 10,
-      /**
-       * §5.11 Gate B. Unset, pg-pool skips its timeout branch entirely (`pg-pool/index.js:206`) and
-       * a waiter queues FOREVER — so an exhausted pool did not slow the gateway down, it hung it,
-       * with no error for any layer above to act on. With it, the wait rejects at `:225` and the
-       * containment built in Gate A takes over: a write retries then abandons with a log line, a
-       * listen repairs via §3 resync, and the connection stays up.
-       *
-       * 500ms, and all three bounds are measured:
-       *  - FLOOR (measured): pool acquisition p99 is 0.143ms at 500 concurrent listens locally,
-       *    worst single acquisition 8.3ms. 500ms is ~3,500x that p99 — healthy traffic cannot reach
-       *    it, even allowing an order of magnitude for RDS holding connections longer than a local
-       *    server does.
-       *  - CEILING: healthz's own probe budget is 2000ms (`metrics.ts`). Going above it would make
-       *    this dead weight — a wait that long fails the health check and the NLB pulls the gateway
-       *    before the timeout could matter.
-       *  - PRODUCT (§5.11 Gate A): the write path retries 3 times inside the serial commit chain, so
-       *    the head-of-line stall is ~3 x (timeout + spacing) — about 1.6s here, against ~6.1s if
-       *    this were 2000ms. The user approved Gate B having seen that arithmetic.
-       */
-      connectionTimeoutMillis: 500,
-      options: `-c search_path=${this.#schema}`,
-    });
+    this.#ownsPool = opts.pool === undefined;
+    this.#ownsListener = opts.listener === undefined;
+    this.#listener = opts.listener ?? new CommitListener(opts.url);
+    this.#pool = opts.pool ?? createPool(opts.url, opts.poolMax ?? 10);
     // A connection that goes away takes its PID with it: Postgres reuses PIDs, and a stale one here
-    // would silently swallow a real notification from another gateway.
-    this.#pool.on('remove', (c) => {
-      const pid = (c as TrackedClient)[BACKEND_PID];
-      if (pid !== undefined) this.#ownPids.delete(pid);
-    });
+    // would silently swallow a real notification from another gateway. Registered through the pool's
+    // ONE handler, and given back in `close()` — see `forgetPidsOnRemove`.
+    this.#unhookPool = forgetPidsOnRemove(this.#pool, (pid) => this.#ownPids.delete(pid));
   }
 
   head(): Promise<number> {
@@ -265,9 +631,92 @@ export class PostgresStorage implements StorageAdapter {
     return { ...this.#applyStats };
   }
 
-  /** §5.6's sidebar. Skip scan over the path index — see TOPNODES_SQL for why, and why not counts. */
+  /**
+   * §5.19: declare a database. Idempotent ON PURPOSE — re-declaring one a client already owns is
+   * not an error, it is a no-op, and making it an error would only teach the console to guess.
+   */
+  async declareDatabase(name: string, by: string, quotaAcqPerSec?: number | null): Promise<void> {
+    // The registry is the door a name comes through, so the rule lives on the door and not only on
+    // the admin route in front of it (§5.22 Gate E). A reserved `_` name reaching the table would
+    // put a real database's numbers in a synthetic metrics label, silently.
+    const bad = validateDatabaseName(name, this.#limits);
+    if (bad) throw new Error(`illegal database name: ${bad}`);
+    await this.#init();
+    /**
+     * §5.24 Gate C. Re-declaring stays a NO-OP on the name (§5.19) and now also on the quota: an
+     * `ON CONFLICT DO UPDATE` here would let a second `POST /databases` with no quota field silently
+     * reset an override somebody set on purpose. Changing a quota is a different act from declaring
+     * a database, and it does not have a door yet — which is the honest state, not a hidden one.
+     */
+    await this.#pool.query(
+      `INSERT INTO ${this.#control}.databases (name, created_by, quota_acq_per_sec)
+       VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING`,
+      [name, by, quotaAcqPerSec ?? null],
+    );
+  }
+
+  /**
+   * §5.24 Gate C: one database's registry row. `null` quota means "the shard's default" — a
+   * different statement from any number, because it follows the shard when the shard changes.
+   *
+   * A name that is not in the registry answers `null` rather than throwing: the DEFAULT tenant is
+   * exactly that case (it is the schema this gateway was configured with, never declared), and it
+   * runs on the shard default like any undecided database.
+   */
+  async describeDatabase(name: string): Promise<{ quotaAcqPerSec: number | null } | null> {
+    await this.#init();
+    const { rows } = await this.#pool.query<{ quota_acq_per_sec: number | null }>(
+      `SELECT quota_acq_per_sec FROM ${this.#control}.databases WHERE name = $1`,
+      [name],
+    );
+    const row = rows[0];
+    return row ? { quotaAcqPerSec: row.quota_acq_per_sec === null ? null : Number(row.quota_acq_per_sec) } : null;
+  }
+
+  /**
+   * §5.24: live bytes per database, for every tenant on this shard, in ONE catalogue query.
+   *
+   * `pg_total_relation_size` on the `nodes` relation and nothing else: the oplog is §9 retention
+   * that shrinks on its own, so billing it would bill a client for our durability window, and
+   * `rev_counter` is a row. The join is `pg_class` to `pg_namespace` because a tenant IS a schema
+   * (§5.22) — so "every database on this shard" is a `GROUP BY nspname` rather than N round trips
+   * on a scrape path. Catalogue-only: it reads sizes, never a tenant's rows.
+   *
+   * `pg_total_relation_size` INCLUDES the indexes and TOAST, which is the honest number for
+   * "what this database costs on disk" and larger than the JSON a client would say they stored.
+   * The RUNBOOK says so where an operator comparing it against `\dt+` would otherwise file a bug.
+   */
+  async storageBytes(): Promise<Record<string, number>> {
+    await this.#init();
+    const { rows } = await this.#pool.query<{ db: string; bytes: string }>(
+      `SELECT n.nspname AS db, sum(pg_total_relation_size(c.oid))::text AS bytes
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'nodes' AND c.relkind = 'r'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        GROUP BY n.nspname`,
+    );
+    return Object.fromEntries(rows.map((r) => [r.db, Number(r.bytes)]));
+  }
+
+  /**
+   * §5.22 Gate D: the registry alone, unqualified by what has data. `topNodes` UNIONs this with the
+   * derived names; whoever is sizing something wants only this half.
+   */
+  async listDeclared(): Promise<string[]> {
+    await this.#init();
+    const { rows } = await this.#pool.query<{ name: string }>(
+      `SELECT name FROM ${this.#control}.databases ORDER BY name`,
+    );
+    return rows.map((r) => r.name);
+  }
+
+  /** §5.6's sidebar. Skip scan over the path index — see `topNodesSql` for why, and why not counts. */
   async topNodes(): Promise<string[]> {
-    const { rows } = await this.#pool.query<{ name: string }>(TOPNODES_SQL);
+    // `#init` first, which this did not do before Gate A and now must: the statement reads the
+    // CONTROL schema's `databases`, and a console asking for the sidebar before any adapter has
+    // applied its schema is the ordinary first request on a fresh shard, not an edge case.
+    await this.#init();
+    const { rows } = await this.#pool.query<{ name: string }>(topNodesSql(this.#control, this.#schema));
     return rows.map((r) => r.name);
   }
 
@@ -280,8 +729,8 @@ export class PostgresStorage implements StorageAdapter {
     // ONE statement, so `rev` and the leaves come from ONE MVCC snapshot (§3): because a commit
     // writes nodes and the counter in the same txn, seeing rev N means seeing all of N's effects.
     const { rows } = await this.#pool.query<{ rev: string; leaves: Leaf[] }>(
-      `SELECT (SELECT v FROM rev_counter WHERE shard = 0) AS rev,
-              (SELECT ${LEAVES('n')} FROM nodes n WHERE ${atOrUnder('n.path')}) AS leaves`,
+      `SELECT (SELECT v FROM ${this.#schema}.rev_counter WHERE shard = 0) AS rev,
+              (SELECT ${LEAVES('n')} FROM ${this.#schema}.nodes n WHERE ${atOrUnder('n.path')}) AS leaves`,
       [path, likeDescendants(path)],
     );
     const row = rows[0] as { rev: string; leaves: Leaf[] };
@@ -396,7 +845,7 @@ export class PostgresStorage implements StorageAdapter {
   async readCatchup(path: string, sinceRev: number, limit: number): Promise<OplogEntry[]> {
     await this.#init();
     const { rows } = await this.#pool.query<OplogRowDb>(
-      `${OPLOG_COLUMNS} WHERE rev > $1 AND ${RELEVANT_SQL} ORDER BY rev LIMIT $4`,
+      `${oplogColumns(this.#schema)} WHERE rev > $1 AND ${RELEVANT_SQL} ORDER BY rev LIMIT $4`,
       [sinceRev, ancestorsInclusive(path), likeDescendants(path), limit],
     );
     return rows.map(toEntry);
@@ -406,7 +855,7 @@ export class PostgresStorage implements StorageAdapter {
   async readOplogSince(afterRev: number, limit: number): Promise<OplogEntry[]> {
     await this.#init();
     const { rows } = await this.#pool.query<OplogRowDb>(
-      `${OPLOG_COLUMNS} WHERE rev > $1 ORDER BY rev LIMIT $2`,
+      `${oplogColumns(this.#schema)} WHERE rev > $1 ORDER BY rev LIMIT $2`,
       [afterRev, limit],
     );
     return rows.map(toEntry);
@@ -436,10 +885,14 @@ export class PostgresStorage implements StorageAdapter {
   }
 
   async close(): Promise<void> {
-    const listener = this.#listenClient;
-    this.#listenClient = null;
-    await listener?.end().catch(() => undefined);
-    await this.#pool.end();
+    this.#closed = true;
+    this.#unhookPool();
+    this.#unlisten?.();
+    this.#unlisten = null;
+    if (this.#ownsListener) await this.#listener.close();
+    // A borrowed pool belongs to whoever built it — ending it here would take every other tenant's
+    // connections down with this one adapter.
+    if (this.#ownsPool) await this.#pool.end();
   }
 
   // ------------------------------------------------------------------ internals
@@ -450,6 +903,15 @@ export class PostgresStorage implements StorageAdapter {
     try {
       await this.#learnPid(c);
       await c.query('BEGIN');
+      // §5.22 Gate B, and `LOCAL` is the mechanism, not a style choice: a plain `SET` outlives the
+      // transaction AND the checkout, so the next tenant to borrow this connection would inherit
+      // this one's schema — measured, and it is the silent cross-tenant write this gate exists to
+      // make impossible. `SET LOCAL` reverts at COMMIT/ROLLBACK, back to `NO_TENANT_SCHEMA`, which
+      // resolves nothing.
+      //
+      // In the PREAMBLE rather than a pool checkout hook, because a hook is a second place to
+      // remember and this must live where the transaction does.
+      await c.query(`SET LOCAL search_path = ${this.#schema}`);
       const out = await fn(c);
       await c.query('COMMIT');
       return out;
@@ -624,7 +1086,11 @@ export class PostgresStorage implements StorageAdapter {
     );
     await this.#prune(c, false);
     // Queued until COMMIT by Postgres, so a listener is never woken for a write it cannot yet read.
-    await c.query('NOTIFY rtdb_commit');
+    // §5.22 Gate C: the tenant's OWN channel. Unqualified, this woke every other tenant's
+    // dispatcher on the same Postgres database — LISTEN/NOTIFY is per-database, not per-schema.
+    // `NOTIFY` takes an identifier, so the constructor's schema-name guard is what makes this safe;
+    // there is deliberately no second check beside it.
+    await c.query(`NOTIFY ${commitChannel(this.#schema)}`);
   }
 
   /**
@@ -664,28 +1130,29 @@ export class PostgresStorage implements StorageAdapter {
   }
 
   /**
-   * §8's "NOTIFY-triggered poll": one dedicated connection (never a pool one — it must not be handed
-   * to a transaction) waiting for another process's commit. The notification is a poke and carries
-   * nothing; the dispatcher learns WHAT changed by re-reading the oplog.
+   * §8's "NOTIFY-triggered poll", now through the shared `CommitListener`: a connection that is
+   * never a pool one — it must not be handed to a transaction — waiting for another process's
+   * commit on THIS tenant's channel. The notification is a poke and carries nothing; the dispatcher
+   * learns WHAT changed by re-reading the oplog.
    *
-   * ponytail: a dropped LISTEN connection is not re-established. In v1 one process both commits and
-   * dispatches, so the local listeners carry every wake-up and this connection is redundant; Phase
-   * 5's second gateway is what makes a reconnect loop here worth writing.
+   * Idempotent, and it has to be: `onCommit` calls it on every subscription.
    */
   async #listen(): Promise<void> {
-    if (this.#listenClient) return;
-    const c = new pg.Client({ connectionString: this.#url });
-    this.#listenClient = c;
-    c.on('error', () => undefined); // a dead poke connection must never take the process with it
-    c.on('notification', (msg) => {
-      if (!this.#ownPids.has(msg.processId)) this.#fire();
+    if (this.#unlisten || this.#closed) return;
+    this.#unlisten = () => undefined; // claim the slot before the await, or two callers race it
+    const stop = await this.#listener.listen(commitChannel(this.#schema), (pid) => {
+      // Our own commits already woke the local listeners synchronously (`#fire` after COMMIT), so a
+      // NOTIFY from one of our own backends must not wake them twice. `-1` is the reconnect poke,
+      // which belongs to nobody and must always land.
+      if (!this.#ownPids.has(pid)) this.#fire();
     });
-    try {
-      await c.connect();
-      await c.query('LISTEN rtdb_commit');
-    } catch {
-      this.#listenClient = null;
-    }
+    // `onCommit` calls this UN-AWAITED, so `close()` can land inside the await above — and when it
+    // does it calls the placeholder, which stops nothing, and this line would then hand a live
+    // subscription to a CLOSED adapter. Measured before this check: the closed adapter still fired
+    // on the next commit, and the shared listener held its callback (and through it the adapter)
+    // for as long as the listener lived — the same pin `8d3be3a` was about, one `await` higher.
+    if (this.#closed) return stop();
+    this.#unlisten = stop;
   }
 
   /**
@@ -722,8 +1189,26 @@ export class PostgresStorage implements StorageAdapter {
         await c.query('BEGIN');
         // Two adapters racing `CREATE TABLE IF NOT EXISTS` against one schema is a known Postgres
         // deadlock; one advisory lock costs nothing and removes the whole class.
+        //
+        // TWO locks now, and the ORDER is load-bearing: control first, tenant second, always. Every
+        // adapter on the shard takes the SAME control lock (one name) and its OWN tenant lock, so a
+        // fixed order means no two adapters can hold one and want the other. Reversed, N adapters
+        // starting together would be a deadlock waiting for the day N is large — and this is Gate
+        // D's precondition, so N is exactly what is coming.
+        await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`rtdb-schema:${this.#control}`]);
+        await c.query(`CREATE SCHEMA IF NOT EXISTS ${this.#control}`);
+        await c.query(CONTROL_SQL(this.#control));
+        // §5.24 Gate C, inside the SAME advisory lock and transaction as the table it alters — a
+        // migration that races N adapters starting together is the one this file already paid for.
+        await c.query(CONTROL_QUOTA_SQL(this.#control));
         await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`rtdb-schema:${this.#schema}`]);
         await c.query(`CREATE SCHEMA IF NOT EXISTS ${this.#schema}`);
+        // The SEVENTH site, and the one exception to "qualify it": `SCHEMA_SQL` is a FILE, and every
+        // statement in it is unqualified. Qualifying it means interpolating a schema name into
+        // `schema.sql`, which stops it being SQL you can run. `SET LOCAL` costs one statement, once
+        // per adapter, at startup — the round-trip argument that rules it out for the hot reads does
+        // not reach here. Measured without it: `no schema has been selected to create in`.
+        await c.query(`SET LOCAL search_path = ${this.#schema}`);
         await c.query(SCHEMA_SQL);
         await c.query(
           `INSERT INTO rev_counter (shard, v, epoch, pruned_through) VALUES (0, 0, $1, 0)
@@ -748,8 +1233,83 @@ export class PostgresStorage implements StorageAdapter {
   async #counter(column: 'v' | 'pruned_through'): Promise<number> {
     await this.#init();
     const { rows } = await this.#pool.query<Record<string, string>>(
-      `SELECT ${column} AS n FROM rev_counter WHERE shard = 0`,
+      `SELECT ${column} AS n FROM ${this.#schema}.rev_counter WHERE shard = 0`,
     );
     return Number((rows[0] as { n: string }).n);
   }
+}
+
+/**
+ * §5.22 Gate D shart (A) — every connection this gateway makes to Postgres, on ONE pool and ONE
+ * listener, the DEFAULT tenant included.
+ *
+ * It lives here rather than inline in `main.ts` for the same reason `createPool` does: it is the
+ * only place that knows the order these three things have to be built in, and that order is the
+ * whole of the condition. Built the other way round — `storageFromEnv()` first, shared pool after —
+ * the default tenant keeps a private pool of 10 and a `CommitListener` of its own, so a
+ * multi-tenant gateway costs `sharedPoolSize(N) + 1` PLUS 11, and `rtdb_pg_pool_waiting` cannot see
+ * the pool that is actually serving today's whole production.
+ *
+ * The probe is the awkward part and it is not avoidable: a `pg.Pool`'s `max` is fixed at
+ * construction, so N has to be read from OUTSIDE the pool that N sizes. One connection, opened and
+ * closed before the real pool exists.
+ */
+export async function openSharedTenancy(opts: {
+  url: string;
+  limits?: Limits;
+  /** The default tenant's schema — what this gateway was already serving. */
+  schema?: string;
+  controlSchema?: string;
+}): Promise<{
+  storage: PostgresStorage;
+  tenantStorage: (db: string) => PostgresStorage;
+  pool: pg.Pool;
+  declared: string[];
+  /** What the pool was sized to, so the boot line can say it without re-deriving it. */
+  max: number;
+  /**
+   * Ends the pool and the listener. It has to exist: with both of them BORROWED, no adapter's own
+   * `close()` touches them any more — `PostgresStorage#close` deliberately leaves a pool it did not
+   * build alone, or one tenant closing would take every other tenant's connections with it. So
+   * whoever built them closes them, which is the same rule, one level up.
+   */
+  close(): Promise<void>;
+}> {
+  const base = {
+    url: opts.url,
+    ...(opts.limits ? { limits: opts.limits } : {}),
+    ...(opts.controlSchema ? { controlSchema: opts.controlSchema } : {}),
+  };
+  const probe = new PostgresStorage({ ...base, schema: opts.schema ?? 'public', poolMax: 1 });
+  let declared: string[];
+  try {
+    declared = await probe.listDeclared();
+  } finally {
+    await probe.close();
+  }
+  /**
+   * N from the REGISTRY, not from `topNodes()`: that one unions the declared names with every
+   * top-level key that has data, so a shard holding 30 raw namespaces under 3 declared databases
+   * sized the pool for 30 — RDS connections spent on `WritePipeline` chains that do not exist.
+   * `+ 1` is the default tenant, which is a database this gateway serves and is never declared.
+   *
+   * Read once, because a pool cannot be resized: a database declared after this shares the reads
+   * headroom until the next restart, which is what `rtdb_pg_pool_waiting` exists to make visible.
+   */
+  const max = sharedPoolSize(declared.length + 1);
+  const pool = createPool(opts.url, max);
+  const listener = new CommitListener(opts.url);
+  const make = (schema: string): PostgresStorage =>
+    new PostgresStorage({ ...base, schema, pool, listener });
+  return {
+    storage: make(opts.schema ?? 'public'),
+    tenantStorage: make,
+    pool,
+    declared,
+    max,
+    close: async () => {
+      await listener.close();
+      await pool.end();
+    },
+  };
 }

@@ -1,4 +1,4 @@
-# RTDB Wire Protocol — v1.5 (FROZEN)
+# RTDB Wire Protocol — v1.6 (FROZEN)
 
 Status: FROZEN (signed off 2026-08-27). Any change needs a Changelog entry + version bump.
 Structure: §1–§10 = v1 CORE (normative, implement all). §11 = EXTENSIONS (design-ready; implement only when explicitly scheduled).
@@ -182,6 +182,7 @@ The relevance query (`descendant OR ancestor`) runs per-listen-resume and per-CA
 - Frame size client->server: 1 MiB. SNAPSHOT_MAX server->client: 4 MiB (beyond -> sub-scoped TOOBIG).
 - MAX_LEAVES_PER_WRITE: 2,000 flattened leaves (bounds the delete+insert work and lock hold of one write; beyond -> TOOBIG).
 - Path depth 32; path length 768 B. CATCHUP_LIMIT 500. Oplog retention: 2h or last 500k revs/shard, whichever smaller. Write rate per connection: 100/s sustained, burst 500 (RATE).
+- Lock acquisitions per database: `QUOTA_ACQ_PER_SEC` 64/s sustained, burst `QUOTA_ACQ_BURST` 128 (RATE, msg `database quota exceeded`). One acquisition per group commit and one per solo CAS, so a write's cost depends on how it batches, not on its size; charged at commit, so admission can lag by up to one group-commit window.
 
 ## 10. Admin plane (frame spec in v1; implementation may lag)
 
@@ -201,6 +202,7 @@ Gateways close all matching connections (WS code 4403). Combined with §3's subs
 
 ## 12. Changelog
 
+- v1.6 (2026-09-06) — §9: per-database quota in LOCK ACQUISITIONS/s, refused with the existing `RATE` code and the message `database quota exceeded`. No frame, field or code changes: `msg` is free text (§4) and a client's §6 handling of `RATE` is unchanged. Written down because it is a limit a client can be refused by and therefore belongs in the protocol, and because the UNIT is the surprising part — measured, writes per acquisition run from 1.00 (a trickling client) to 500.00 (one burst), so a writes/second number prices two identical bills 500x apart.
 - v1.5 (2026-08-28) — §2: `epoch` added to helloAck (shard generation; bumped on PITR restore/reset). Client rule: epoch change -> wholesale drop of mirrors, per-leaf revs, tombstones and lastRevs, fresh snapshots, pending writes replay normally. Closes the Gate D finding: a restored (backwards) head made §7's LWW silently diverge a live client. Added pre-Kotlin-SDK deliberately, so no SDK generation ever ships without it.
 - v1.4 (2026-08-28) — two clarifications codifying behavior found necessary in Gate D chaos testing: §3 a `lastRev` above the shard head is not retained -> snapshot; §7 a delta at `path` implicitly clears a non-tombstone scalar ancestor leaf (the server never emits a delta for it).
 - v1.3 (2026-08-28) — §7: per-leaf rev LWW extended to snapshot application (leaves/tombstones newer than the snapshot's rev survive it). Found during Gate C review: with per-sub setup buffering, an overlapping live sub can wire-deliver `delta(N+1), snapshot(N), delta(N+1)` — the client must not visibly roll back in between.

@@ -13,7 +13,9 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Rules } from '../pipeline/rules.ts';
 import { MemoryStorage } from '../storage/memory.ts';
-import { PostgresStorage } from '../storage/postgres.ts';
+import { openSharedTenancy, PostgresStorage } from '../storage/postgres.ts';
+import { bindPoolWaiting } from './metrics.ts';
+import type { StorageAdapter as Adapter } from '../storage/adapter.ts';
 
 /**
  * Standalone gateway process, so the chaos runner can SIGKILL it and start it again
@@ -21,32 +23,101 @@ import { PostgresStorage } from '../storage/postgres.ts';
  * `RTDB_LIMITS` is a JSON patch over the §9 defaults.
  */
 const port = Number(process.env['RTDB_PORT'] ?? 0);
-const limits: Limits = makeLimits(
-  process.env['RTDB_LIMITS'] ? (JSON.parse(process.env['RTDB_LIMITS']) as Partial<Limits>) : {},
-);
+/**
+ * §5.23: the per-database acquisition quota, as its own knobs rather than only inside `RTDB_LIMITS`.
+ * These two are deploy-review numbers — the shard's ceiling is ~129 acq/s and the default takes
+ * half of it — so an operator changes them the way they change the pool size, not by hand-writing a
+ * JSON patch. `RTDB_LIMITS` still wins if it names them, because it is the more specific instrument.
+ */
+const quotaPerSec = Number(process.env['RTDB_QUOTA_ACQ_PER_SEC'] ?? 0);
+const quotaBurst = Number(process.env['RTDB_QUOTA_ACQ_BURST'] ?? 0);
+const limits: Limits = makeLimits({
+  ...(quotaPerSec > 0 ? { QUOTA_ACQ_PER_SEC: quotaPerSec } : {}),
+  ...(quotaBurst > 0 ? { QUOTA_ACQ_BURST: quotaBurst } : {}),
+  ...(process.env['RTDB_LIMITS'] ? (JSON.parse(process.env['RTDB_LIMITS']) as Partial<Limits>) : {}),
+});
+
+/**
+ * §5.23 faisla 5: how many gateways serve this shard. Each takes `1/G` of every database's quota,
+ * because the bucket is per gateway and a shared one would put a Redis round trip on the write path.
+ * Production runs 2; unset is 1, which is every test and every single-gateway deployment.
+ */
+const gatewayCount = Number(process.env['RTDB_GATEWAY_COUNT'] ?? 1);
 
 /**
  * §2 wiring: `RTDB_STORAGE=memory|postgres`, memory by default — nothing that does not ask for
  * Postgres changes behaviour. `RTDB_PG_SCHEMA` exists so several gateways (chaos scenarios, CI) can
  * share one database without sharing a shard.
  */
-function storageFromEnv(): StorageAdapter {
-  const kind = process.env['RTDB_STORAGE'] ?? 'memory';
-  if (kind === 'memory') return new MemoryStorage(limits, process.env['RTDB_PERSIST']);
-  if (kind !== 'postgres') throw new Error(`RTDB_STORAGE must be "memory" or "postgres", got "${kind}"`);
+const storageKind = process.env['RTDB_STORAGE'] ?? 'memory';
+const defaultSchema = process.env['RTDB_PG_SCHEMA'] ?? 'public';
+// §5.22 Gate A. Unset is the right answer for a single shard — the default is a real, distinct
+// schema, not the tenant's — and this exists so two shards can share one Postgres database the same
+// way `RTDB_PG_SCHEMA` already lets them.
+const controlSchema = process.env['RTDB_CONTROL_SCHEMA'];
+const control = controlSchema ? { controlSchema } : {};
+
+function pgUrl(): string {
   const url = process.env['RTDB_PG_URL'];
   if (!url) throw new Error('RTDB_STORAGE=postgres requires RTDB_PG_URL');
+  return url;
+}
+
+function storageFromEnv(): StorageAdapter {
+  if (storageKind === 'memory') return new MemoryStorage(limits, process.env['RTDB_PERSIST']);
+  if (storageKind !== 'postgres') {
+    throw new Error(`RTDB_STORAGE must be "memory" or "postgres", got "${storageKind}"`);
+  }
   // Deploy-review knob (WORKLOAD §2): connections per gateway to RDS. Unset keeps WP4's 10.
   const poolMax = Number(process.env['RTDB_PG_POOL'] ?? 0);
   return new PostgresStorage({
-    url,
+    url: pgUrl(),
     limits,
-    schema: process.env['RTDB_PG_SCHEMA'] ?? 'public',
+    schema: defaultSchema,
+    ...control,
     ...(poolMax > 0 ? { poolMax } : {}),
   });
 }
 
-const storage = storageFromEnv();
+/**
+ * §5.22 Gate D: one database per Postgres SCHEMA, all of them sharing this process's pool and its
+ * one LISTEN connection — which is the whole of Gates B and C paying off. Off unless asked for:
+ * unset, this gateway is the single-database deployment it has always been.
+ *
+ * `RTDB_MULTI_TENANT=1` and Postgres only. Memory storage has no schemas to put tenants in, and a
+ * per-tenant `MemoryStorage` would be N independent heaps in one process — a demo of the shape, not
+ * the shape. Refusing is better than a version of this that only looks like it works.
+ *
+ * It is decided HERE, before `storage` exists, because shart (A) is about the ORDER: the shared
+ * pool and listener are built FIRST and the default tenant is built ON them. Built the other way
+ * round it kept a private pool of 10 and a `CommitListener` of its own — 11 connections per gateway
+ * that no `rtdb_pg_pool_waiting` could see, on the tenant that is today's entire production.
+ */
+const multiTenant = process.env['RTDB_MULTI_TENANT'] === '1';
+if (multiTenant && storageKind !== 'postgres') {
+  throw new Error('RTDB_MULTI_TENANT=1 requires RTDB_STORAGE=postgres: a tenant is a schema.');
+}
+
+let tenantStorage: ((db: string) => Adapter) | undefined;
+let storage: StorageAdapter;
+/**
+ * What SIGTERM has to close. In the single-tenant case the adapter owns its pool and its listener
+ * and closing it is enough; sharing them moves that responsibility to whoever BUILT them, because
+ * an adapter deliberately never ends a pool it borrowed.
+ */
+let closeStorage: () => Promise<unknown> = () => Promise.resolve(storage.close?.());
+if (multiTenant) {
+  const shared = await openSharedTenancy({ url: pgUrl(), limits, schema: defaultSchema, ...control });
+  storage = shared.storage;
+  tenantStorage = shared.tenantStorage;
+  bindPoolWaiting(() => shared.pool.waitingCount);
+  closeStorage = shared.close;
+  process.stderr.write(
+    `rtdb multi-tenant: ${shared.declared.length} declared databases, pool max ${shared.max}\n`,
+  );
+} else {
+  storage = storageFromEnv();
+}
 
 /**
  * §8 fanout wiring. `RTDB_REDIS_URL` set -> this gateway joins the shard's bus; unset -> the
@@ -147,11 +218,28 @@ if (rulesPath) {
   );
 }
 
+/**
+ * §5.20 Phase 1's tenancy switch. ON, a token that carries no `ns` claim may not read or write
+ * anything (console subjects excepted — §5.9 governs those). OFF, this gateway is the
+ * single-database deployment it has always been.
+ *
+ * It is NOT fail-closed the way `RTDB_RULES` above is, and that is deliberate rather than an
+ * oversight: production `c0337c4` is serving app tokens that were minted before this claim existed,
+ * so demanding it here would refuse every live client on the next deploy. The switch flips when the
+ * console has re-minted those tokens with `ns` — which is Phase 1's other half, `/app-token`.
+ */
+const requireNs = process.env['RTDB_REQUIRE_NS'] === '1';
+
 const gw = await startGateway({
   port,
   limits,
   storage,
   shard,
+  requireNs,
+  ...(gatewayCount > 1 ? { gatewayCount } : {}),
+  ...(tenantStorage ? { tenantStorage } : {}),
+  // Gate E's label for the default tenant: the schema this gateway was already serving.
+  db: defaultSchema,
   ...(redis ? { redis } : {}),
   ...(prune ? { prune } : {}),
   ...(rules ? { rules } : {}),
@@ -164,7 +252,8 @@ const gw = await startGateway({
  * Off by default so nothing that does not ask for it changes (the whole local battery included).
  */
 const adminPort = Number(process.env['RTDB_ADMIN_PORT'] ?? 0);
-const admin = adminPort > 0 ? await startAdminServer({ port: adminPort, storage }) : null;
+const admin =
+  adminPort > 0 ? await startAdminServer({ port: adminPort, storage, db: defaultSchema }) : null;
 
 // The runner reads this line to learn the port when it asked for an ephemeral one.
 process.stdout.write(`rtdb listening ${gw.port}\n`);
@@ -176,7 +265,7 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     admin?.close();
     // The pool and the LISTEN connection outlive the socket; a SIGTERMed gateway must not leave
     // backends open behind it. SIGKILL gets no such courtesy, which is the point of the chaos suite.
-    void Promise.resolve(storage.close?.())
+    void Promise.resolve(closeStorage())
       .then(() => redis?.close())
       .catch(() => undefined)
       .finally(() => process.exit(0));

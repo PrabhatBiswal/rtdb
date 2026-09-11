@@ -26,6 +26,11 @@ COPY --from=deps /rds-global-bundle.pem /etc/ssl/rds/global-bundle.pem
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+# `main.ts` refuses to boot on Postgres without `RTDB_RULES` (§5.19), and the module it names is
+# resolved against the WORKING DIRECTORY — so a production image without this line cannot start at
+# all: the file the env var points at is simply not in it. Found by reading, before the deploy that
+# would have discovered it as a `DEPLOY FAILED` on the first gateway (§5.25 finding 1).
+COPY rules ./rules
 # 8080 = the WSS listener the NLB targets; 9090 = /metrics + /healthz, never published (§2).
 EXPOSE 8080 9090
 USER node

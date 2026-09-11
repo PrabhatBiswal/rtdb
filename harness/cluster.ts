@@ -28,10 +28,15 @@ export async function startCluster(overrides: Partial<Limits> = {}): Promise<Clu
   const limits = makeLimits({ BACKOFF_CAP_MS: 40, ...overrides });
   const redis = await RedisProcess.start();
   const schema = uniqueSchema('cluster');
+  // §5.22 Gate A: its own control schema as well as its own tenant schema — both minted here, both
+  // dropped below. The default would be shared with every other suite against this database and
+  // would outlive the run, which is the leftover discipline this harness already holds for schemas.
+  const control = uniqueSchema('clusterctl');
   const env = {
     RTDB_STORAGE: 'postgres',
     RTDB_PG_URL: PG_URL,
     RTDB_PG_SCHEMA: schema,
+    RTDB_CONTROL_SCHEMA: control,
     RTDB_REDIS_URL: redis.url,
   };
   const a = await GatewayProcess.start(overrides, 0, undefined, env);
@@ -66,6 +71,7 @@ export async function startCluster(overrides: Partial<Limits> = {}): Promise<Clu
       }
       await redis.stop();
       await dropSchema(schema).catch(() => undefined);
+      await dropSchema(control).catch(() => undefined);
     },
   };
 }

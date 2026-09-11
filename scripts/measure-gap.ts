@@ -96,6 +96,10 @@ class GapStorage implements StorageAdapter {
   readCatchup(p: string, s: number, l: number) { return this.inner.readCatchup(p, s, l); }
   readOplogSince(a: number, l: number) { return this.inner.readOplogSince(a, l); }
   topNodes(): Promise<string[]> { return this.inner.topNodes(); }
+  declareDatabase(n: string, by: string): Promise<void> { return this.inner.declareDatabase(n, by); }
+  listDeclared(): Promise<string[]> { return this.inner.listDeclared(); }
+  storageBytes(): Promise<Record<string, number>> { return this.inner.storageBytes(); }
+  describeDatabase(n: string) { return this.inner.describeDatabase(n); }
   onCommit(cb: () => void): () => void { return this.inner.onCommit(cb); }
 }
 

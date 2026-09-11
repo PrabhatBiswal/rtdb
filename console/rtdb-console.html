@@ -127,6 +127,25 @@
   .stat.gws i { font-style:normal; color:var(--dimmer); font:11.5px var(--mono); }
   .stat.gws b { font:12.5px var(--mono); font-variant-numeric:tabular-nums;
                 color:var(--fg-2); font-weight:600; }
+  /* §5.24 usage tile */
+  /* §5.29: the tree pane's header, not a card — no border, no radius, no surface; one rule
+     separates it from the tree below it. `flex:none` so the tree keeps the scrolling. */
+  #usage { flex:none; padding:9px 18px 8px; border-bottom:1px solid var(--line-soft); }
+  .usage-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:6px 18px;
+                font:12px var(--ui); color:var(--dim); }
+  .usage-head > b { font:13px var(--mono); color:var(--fg); }
+  .usage-age { font:11px var(--ui); color:var(--dimmer); }
+  .usage-age.stale { color:var(--warn); }
+  /* Still `wrap`, and `min-width` is gone: a narrow window drops a metric onto a second line
+     instead of forcing the row wider than the pane. */
+  .usage-lines { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 18px; }
+  .usage-line { display:flex; flex-direction:row; align-items:baseline; gap:6px; }
+  .usage-line b { font:15px var(--mono); font-variant-numeric:tabular-nums; color:var(--fg); font-weight:600; }
+  .usage-line b.warn { color:var(--warn); }
+  .usage-line i { font-style:normal; font:12px var(--ui); color:var(--dim); }
+  /* The caption is on the row's `title=` now. Kept in the DOM, off the screen. */
+  .usage-line small { display:none; }
+  .usage-note { margin-top:6px; font:11px var(--ui); color:var(--dimmer); }
   .stat-age { font:11px var(--ui); color:var(--dimmer); }
   .stat-age.stale { color:var(--warn); }
 
@@ -159,6 +178,9 @@
      were undiscoverable and an operator had to be TOLD that `userstatus` existed. This lists them,
      fetched out of band of the wire from the gateway's admin port. */
   #workspace { display:flex; flex:1 1 auto; min-height:0; }
+  /* §5.29: the tree's column — usage header on top, scrolling tree under it. `min-width:0` so a
+     long row inside the tile cannot push the pane wider than the window. */
+  #main { display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; }
   #roots { flex:none; width:186px; border-right:1px solid var(--line-soft); overflow-y:auto;
            padding:14px 0 20px; display:flex; flex-direction:column; gap:1px; }
   #roots[hidden] { display:none; }
@@ -403,16 +425,44 @@
   <span class="stat gws" id="st-gws"></span>
   <span class="stat"><b id="st-writes">–</b><i>writes/s</i></span>
   <span class="stat"><b id="st-lag">–</b><i>consumer lag</i></span>
+  <!-- §5.22 Gate E: how many databases are NOT on exactly one leader — 0 is healthy, and both
+       directions are failures (2+ is a split brain, 0 means nobody publishes that database). -->
+  <span class="stat"><b id="st-leaders">–</b><i>leaderless dbs</i></span>
   <span class="grow"></span>
+  <span class="stat"><b id="st-shard-load">–</b><i>shard load</i></span>
   <span class="stat-age" id="st-age"></span>
 </div>
 
 <div id="workspace">
 <aside id="roots" hidden>
-  <div class="roots-head"><span>namespaces</span><span class="grow"></span><button id="roots-add" title="add a top-level namespace" hidden>+</button><button id="roots-refresh" title="refresh (the gateway caches this for 10s)">&#8635;</button></div>
+  <div class="roots-head"><span>databases</span><span class="grow"></span><button id="roots-add" title="create a database" hidden>+</button><button id="roots-refresh" title="refresh (the gateway caches this for 10s)">&#8635;</button></div>
   <div class="roots-note" id="roots-note">not loaded</div>
 </aside>
+<div id="main">
+<!-- §5.24: this database's own line — Firebase's four, plus Load. Hidden until a database is
+     chosen, because every number in it is about ONE database and there is no honest total.
+     §5.29: it lives HERE, above the tree, because the strip above is the SHARD's and this is one
+     database's — the same one the tree is showing. One row, not a card: the long captions moved to
+     `title=` so a glance costs one line and the explanation is still a hover away. Every id is
+     unchanged and no script line moved; the captions stay in the DOM as `small`, hidden, so the
+     text has one home in this file even though the attribute is what renders. -->
+<section id="usage" hidden aria-label="usage for this database">
+  <div class="usage-head">
+    <b id="us-db">–</b>
+    <div class="usage-lines">
+      <div class="usage-line" title="console sessions included"><b id="us-conns">–</b><i>connections</i><small>console sessions included</small></div>
+      <div class="usage-line" title="on-disk, high-water; history excluded"><b id="us-storage">–</b><i>storage</i><small>on-disk, high-water; history excluded</small></div>
+      <div class="usage-line" title="before TLS — the bill is 1.0–1.3× this, by traffic shape"><b id="us-downloads">–</b><i>downloads</i><small>before TLS — the bill is 1.0–1.3× this, by traffic shape</small></div>
+      <div class="usage-line" title="share of this shard's write lock; RATE begins near 100%"><b id="us-load">–</b><i>load</i><small>share of this shard's write lock; RATE begins near 100%</small></div>
+      <div class="usage-line" title="lock acquisitions/s allowed; a burst of any size is one"><b id="us-quota">–</b><i>quota</i><small>lock acquisitions/s allowed; a burst of any size is one</small></div>
+    </div>
+    <span class="grow"></span>
+    <span class="usage-age" id="us-age"></span>
+  </div>
+  <div class="usage-note" id="us-note">Writes and storage are isolated per database. Fanout CPU is not — it is per gateway and does not divide by database.</div>
+</section>
 <div id="tree"><div class="empty"><b>Not connected</b><span id="empty-hint">Sign in to begin.</span></div></div>
+</div>
 </div>
 
 <footer>
@@ -630,8 +680,167 @@ function writeOutcomeMessage(f) {
   return { ok: false, text: 'unexpected reply: ' + f.type };
 }
 
+/**
+ * §5.22 Gate F: which DATABASE a path is in. The first segment, because that is what a database IS
+ * on the wire (§5.19) — `chat/rooms/r1` is `rooms/r1` inside `chat`.
+ */
+function databaseOf(path) {
+  return String(path || '').trim().replace(/^\/+|\/+$/g, '').split('/')[0] || '';
+}
+
+/**
+ * The `ns` claim inside a token, for DISPLAY — decoded, never verified.
+ *
+ * This is the file:// half of "the console knows which database it is on". Served, the answer comes
+ * from `/wire-token`'s response and is authoritative; opened as a file there is no auth-server to
+ * ask and the only thing to read is the token the operator pasted. Reading it is safe precisely
+ * because nothing is trusted to it: the gateway verifies the signature and picks the tenant itself,
+ * so a doctored payload here changes a label on the screen and nothing else. Returns null for a
+ * token with no `ns`, which is the correct spelling of "the default database".
+ */
+function tokenDatabase(token) {
+  try {
+    const body = String(token).split('.')[1];
+    if (!body) return null;
+    const json = typeof atob === 'function'
+      ? atob(body.replace(/-/g, '+').replace(/_/g, '/'))
+      : Buffer.from(body, 'base64url').toString('utf8');
+    const ns = JSON.parse(json).ns;
+    return typeof ns === 'string' && ns ? ns : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * §5.22 Gate F-2: everything a console connection OWNS, dropped when that connection is replaced.
+ *
+ * It lives in this block rather than beside the socket code because it is the half of the switch a
+ * test can hold: `mirror.dropServerState()` is the line that stops the OLD database's tree being
+ * rendered under the new one's paths. Both are just trees of the same shape, so without it the
+ * console draws `car/players` while its socket is on `chat` — no error, nothing on the wire, just
+ * the wrong data under the right name. The `watched` half matters for the same reason one step
+ * later: `helloAck` re-listens everything still in it, which would send `listen car/players` to the
+ * chat tenant.
+ */
+function dropConnectionState(state) {
+  state.subs.clear();
+  state.watched.clear();
+  state.mirror.dropServerState();
+}
+
+/**
+ * Which CONNECTION a path belongs on: a declared database's name, or `null` for the default tenant.
+ * Compare it with the connection you have; equal means stay.
+ *
+ * `helloAck` carries ONE rev and ONE epoch (§2), so a socket belongs to one tenant for its whole
+ * life — "go to `chat/rooms`" from a connection on `car` is not a listen, it is a reconnect.
+ *
+ * `declared` is the REGISTRY (Gate F-3, `/topnodes`), and it is the whole of the decision. A top
+ * level name is either a database — declared, mintable, its own tenant — or it is a raw subtree of
+ * the DEFAULT tenant, which is where production's `userstatus` still lives and where anything
+ * written before a database was declared lives. Those two look identical in the sidebar and read
+ * completely differently on the wire, and guessing between them is what Gate F set out to stop:
+ * "stay on this connection" is right only when the connection is the default one. From `car`, a raw
+ * name would be read inside CAR's schema — the same silent wrong data, one database over.
+ */
+function switchTargetFor(path, currentDb, declared) {
+  const db = databaseOf(path);
+  if (!db) return undefined;
+  /**
+   * The database this connection is ALREADY on counts as declared whatever the list says, and that
+   * is not a shortcut — we hold a token naming it and the gateway accepted that token, which is a
+   * better authority than a list fetched over HTTP. It covers file://, where there is no
+   * auth-server to ask at all: without it a drill INSIDE our own database would resolve to the
+   * default tenant.
+   *
+   * `declared` is a Set, and only a Set. It carried an `indexOf` fallback for an array; two shapes
+   * for one input is two things to be wrong about, and the caller has always passed a Set.
+   */
+  const has = db === currentDb || (declared ? declared.has(db) : false);
+  // A raw name's home is the DEFAULT tenant, which has no name to mint for — so `null` is both
+  // "that connection" and the instruction for reaching it (a session token, no mint).
+  const target = has ? db : null;
+  /**
+   * Three answers, not two, and the third is why: `undefined` is STAY, `null` is "switch to the
+   * default tenant", a string is "switch to that database". Collapsing the last two would make
+   * "already on default" and "go back to default" the same answer, and going back is the case this
+   * gate exists for — before Gate F-3 there was no way back at all.
+   */
+  return target === (currentDb ?? null) ? undefined : target;
+}
+
+/**
+ * Retire a socket that is being REPLACED, in this order and for one reason each.
+ *
+ * `onclose` first, because that handler is §6's reconnect backoff: leave it attached and closing
+ * the socket schedules a re-open of the very connection we are leaving, and the console ends up on
+ * two databases at once. `onmessage` next, so a frame already in flight from the old tenant cannot
+ * land in the new tenant's mirror. Only then the close.
+ *
+ * Its own function so the ORDER is testable without a DOM — the page's socket code is not, and the
+ * ordering is the whole of the property.
+ */
+function retireSocket(ws) {
+  if (!ws) return;
+  ws.onclose = null;
+  ws.onmessage = null;
+  try { ws.close(1000, 'database switch'); } catch (e) { /* already gone */ }
+}
+
+/**
+ * §5.24 Gate B: the usage tile's four Firebase lines plus Load, turned from `/usage`'s answer into
+ * what a person reads. In the wire block, with no DOM, because this is the part a test can hold —
+ * and because the rounding rules ARE the claim: a database at zero must read "0 B", never "—",
+ * or an empty database looks like a broken panel (§5.19: an owner hands over an empty database and
+ * the line has to be there).
+ */
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return `${Math.round(b)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = b / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+/** `/usage` answers Prometheus' shape: a list of series. One number, or zero if it said nothing. */
+function firstValue(series) {
+  const v = Array.isArray(series) && series.length ? Number(series[0].value) : 0;
+  return Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * The five lines, formatted, plus whether Load is in the warning band.
+ *
+ * Load is a FRACTION of the shard's lock — 0.8 is the warn line because a database approaching 1.0
+ * is one about to start seeing `RATE` (§5.23), which is what Firebase means by "approaches 100%".
+ */
+function usageLines(d) {
+  const load = firstValue(d && d.load);
+  /**
+   * §5.24 Gate C. Two statements, not one number: "64 (default)" follows the shard when the shard's
+   * number changes, "120 (set)" is a decision somebody made about THIS database and will not move.
+   * A client reading a limit needs to know which of those they are looking at before they plan
+   * around it. Absent (an older gateway, or nothing scraped yet) says so rather than inventing 64.
+   */
+  const q = Array.isArray(d && d.quotaAcqPerSec) ? (d.quotaAcqPerSec[0] || null) : null;
+  return {
+    quota: q ? `${Math.round(Number(q.value))}/s ${q.source === 'override' ? '(set)' : '(default)'}` : '—',
+    connections: String(Math.round(firstValue(d && d.connections))),
+    storage: fmtBytes(firstValue(d && d.storageBytes)),
+    downloads: `${fmtBytes(firstValue(d && d.downloadsPerSec))}/s`,
+    load: `${(load * 100).toFixed(load < 0.1 ? 1 : 0)}%`,
+    loadWarn: load >= 0.8,
+    rejecting: firstValue(d && d.quotaRejectedPerSec) > 0,
+    shardLoad: `${(firstValue(d && d.shardLoad) * 100).toFixed(0)}%`,
+  };
+}
+
 if (typeof module === 'object') {
-  module.exports = { outboundAllowed, parseTypedValue, buildPut, writeOutcomeMessage, READ_FRAMES, WRITE_ROLES };
+  module.exports = { outboundAllowed, parseTypedValue, buildPut, writeOutcomeMessage, READ_FRAMES, WRITE_ROLES,
+                     databaseOf, tokenDatabase, switchTargetFor, dropConnectionState, retireSocket,
+                     fmtBytes, firstValue, usageLines };
 }
 </script>
 <script>
@@ -648,6 +857,56 @@ const subs = new Map();            // subId -> {path, lastRev, err}
 const watched = new Map();         // path -> {expanded, subId, json}
 let ws = null, epoch = null, subSeq = 0, attempt = 0, pingTimer = null, pongTimer = null, retryTimer = null;
 let token = '', url = '', manualClose = false;
+
+/**
+ * §5.22 Gate F: the database THIS socket is on. `null` is the default tenant — a token with no `ns`,
+ * which is every console session at sign-in and every file:// token pasted before this existed.
+ *
+ * Served, it comes from `/wire-token`'s answer, which is authoritative. At the first connect, in
+ * both modes, it comes from the token itself (`tokenDatabase`, decoded not verified) — the same
+ * answer, and the only one available on file://.
+ */
+let currentDb = null;
+/** A drill waiting for the socket it needs. Completed by `helloAck`, cleared by nothing else. */
+let pendingDrill = null;
+/** True from the moment a switch closes the old socket until the new one is asked for. Two switches
+ *  in flight would leave two sockets open, which is the exact thing this whole path exists to
+ *  prevent — a double click on the sidebar is not an exotic input. */
+let switching = false;
+/** The signed-in localpart, kept so the mode tag can be redrawn when the database changes. */
+let myName = '';
+/**
+ * §5.22 Gate F-3: which of the sidebar's names are DATABASES. `/topnodes` sends both lists because
+ * they are two different claims — every top-level name that exists, and the registry. A name that
+ * is not in here is a raw subtree of the DEFAULT tenant, and drilling into it means going back to
+ * that connection rather than reading it inside whichever tenant we happen to be on.
+ */
+let declared = new Set();
+/**
+ * §5.22 Gate F-3b: whether that list has EVER arrived. Not the same question as whether it is
+ * empty, and the difference is a silent wrong read.
+ *
+ * "Empty" is not a safe default the way it looks. Straight after sign-in `currentDb` is null and
+ * `declared` is empty, so `switchTargetFor('chat/x', null, ∅)` answers STAY — and the listen goes
+ * down the DEFAULT tenant's socket and reads `chat/x` inside its schema. That is precisely the
+ * Gate F-2 bug, for the one round trip until `/topnodes` answers, in the window right after login
+ * where an operator's first click lands. It fails toward the default tenant, which is where the
+ * console already is — and that is exactly what makes it silent.
+ *
+ * So a drill that arrives before the answer WAITS for it rather than guessing (`drillTo` queues
+ * into `pendingDrill`, `loadRoots` flushes it). The connect path is untouched: nothing awaits
+ * `/topnodes`, the gate just holds the one thing that cannot be decided without it.
+ *
+ * DOM-bound like the rest of the socket code, so there is no test — the mentor's class (2) note at
+ * §5.22 Gate F-2. The decision this protects (`switchTargetFor`) is tested; the queue is not.
+ */
+let declaredKnown = false;
+/**
+ * §5.24 Gate C: the DEFAULT tenant's name, from `/topnodes`. `currentDb` is null when a connection
+ * is on it — there is no `ns` to name it by — but it is a real database with real numbers, and
+ * today it is production's whole dataset. This is what the usage tile asks about in that case.
+ */
+let defaultDb = '';
 
 // When served, the token comes back from POST /login and lives here — in memory, no cookie, no
 // localStorage, gone when the tab closes. `tokenEl` is null in that case because the field is gone.
@@ -687,6 +946,17 @@ function send(frame) {
 
 /** Whether to OFFER editing. What happens if the offer is wrong is the gateway's business. */
 const canWrite = () => WRITE_ROLES.has(myRole);
+
+/**
+ * The brand tag: role, who, and WHICH DATABASE. The third is §5.22 Gate F-2's — what is on screen
+ * is one database's tree and every path drawn is relative to it, so the one thing a person must
+ * never be wrong about is which one they are editing. Redrawn on every switch, not only at sign-in.
+ */
+function renderModeTag() {
+  if (!myName) return;
+  $('#mode-tag').textContent = (canWrite() ? 'rw · ' : 'read-only · ') + myName +
+                               ' · ' + (currentDb || 'default');
+}
 
 /**
  * In-flight writes, by writeId. A write that is never answered must not sit here silently: P1's
@@ -730,7 +1000,90 @@ function connect() {
   url = $('input[name=url]').value.trim();
   token = tokenEl ? tokenEl.value : authToken;
   if (!url || !token) return showErr('url and token are both required');
+  // Whatever database this token names, that is where this socket is about to land — the gateway
+  // chooses the tenant from `ns` at hello and nothing here can change it afterwards. A session
+  // token names none, so this is `null` and the socket is on the default tenant, unchanged.
+  currentDb = tokenDatabase(token);
+  renderModeTag();
   manualClose = false;
+  open();
+}
+
+/**
+ * Everything this page holds that belongs to ONE server connection. Extracted because §5.22 Gate F
+ * gave it a second caller: switching database is a reconnect, and a reconnect that keeps the mirror
+ * renders the OLD database's data under the new one's paths — silently, since both are just trees.
+ */
+function resetServerState() {
+  ws = null; epoch = null;
+  dropConnectionState({ subs, watched, mirror });
+}
+
+/**
+ * §5.22 Gate F-2: move this console onto another database.
+ *
+ * Old socket CLOSED first, then a token for the new database, then a fresh hello — never two live
+ * at once. §2 gives a connection one epoch and one rev, both facts about one tenant's oplog, so
+ * there is no version of this that keeps the socket; and `rtdb_connections{db=…}` is per database,
+ * so a console that left the old one open would be counted on both.
+ *
+ * The old socket's `onclose` is detached before the close: it is the §6 backoff, and re-opening the
+ * connection we are deliberately leaving is exactly the two-sockets bug.
+ */
+async function switchDatabase(db) {
+  if (switching) return;
+  switching = true;
+  const old = ws;
+  resetServerState();
+  retireSocket(old);
+  stopPings();
+  clearTimeout(retryTimer);
+  setState('connecting'); showErr('');
+
+  /**
+   * §5.22 Gate F-3: `null` is the DEFAULT tenant, and the way back to it is the SESSION token —
+   * the one `/login` minted, which carries no `ns` and therefore lands there (`server.ts`'s hello
+   * chain). There is nothing to mint: the default tenant is whatever schema the gateway was
+   * configured with and has no registry name to ask for. Without this there was no way back at
+   * all, and in multi-tenant every raw namespace that predates the registry — production's whole
+   * tree today — lives there.
+   */
+  if (db === null) {
+    token = authToken;
+    currentDb = null;
+    renderModeTag();
+    attempt = 0;
+    switching = false;
+    open();
+    return;
+  }
+
+  let d;
+  try {
+    const r = await fetch('/wire-token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + authToken },
+      body: JSON.stringify({ database: db }),
+    });
+    d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+  } catch (e) {
+    // `currentDb` is deliberately NOT touched: the switch did not happen, so clicking the same
+    // database again is a retry rather than a no-op. There is no socket and nothing is retrying it,
+    // which is what `closed` says and `idle` would not.
+    pendingDrill = null;
+    switching = false;
+    setState('closed');
+    return showErr('could not open database ' + db + ': ' + (e && e.message ? e.message : e));
+  }
+  token = d.token;
+  currentDb = d.database;
+  renderModeTag();
+  // §5.24: the tile is about `currentDb`, so a switch makes its numbers wrong immediately. Ask
+  // again now rather than showing the previous database's usage for the rest of the interval.
+  void pollUsage();
+  attempt = 0;
+  switching = false;
   open();
 }
 
@@ -769,6 +1122,9 @@ function onFrame(f) {
       loadRoots(false);
       startPings();
       render();
+      // §5.22 Gate F-2: the drill that asked for this socket. It could not run before now — the
+      // listen it sends is the first thing that would have gone to the wrong tenant.
+      if (pendingDrill !== null) { const p = pendingDrill; pendingDrill = null; drillTo(p); }
       return;
     }
     case 'pong': clearTimeout(pongTimer); pongTimer = null; return;
@@ -1096,6 +1452,47 @@ function drillTo(path) {
   const p = String(path || '').trim().replace(/^\/+|\/+$/g, '');
   if (!p) return showErr('root is never listened to (§3 SNAPSHOT_MAX)');
   if (p === currentRoot()) { syncPathBar(); return; }
+
+  /**
+   * §5.22 Gate F-2, and it is HERE and only here on purpose: the sidebar, the path bar and the
+   * crumbs all navigate through this function — the sidebar's own comment already says it does not
+   * get its own way of getting there — so one check covers every way into another database.
+   *
+   * Before this, a click on a database the operator does not hold a token for sent `listen chat/…`
+   * down the session's socket, which is on the DEFAULT tenant: the console read `chat/rooms` inside
+   * the default tenant's schema and drew whatever was there — usually nothing — with no error at
+   * all, because `outsideOwnDatabase` exempts `console-` subjects everywhere.
+   */
+  /**
+   * §5.22 Gate F-3b: nothing can be decided about `p` until we know which names are databases, and
+   * guessing here reads one database's path inside another. Queue it; `loadRoots` runs it.
+   */
+  if (SERVED && !declaredKnown) {
+    pendingDrill = p;
+    // And SAY so. A queued drill that draws nothing is a click that did nothing, and if the first
+    // `/topnodes` fails outright this is the only sign the console is waiting rather than broken —
+    // the sidebar's refresh retries it, and the flush runs the drill. Cleared by the drill itself.
+    showErr('waiting for the database list…');
+    return;
+  }
+
+  const target = switchTargetFor(p, currentDb, declared);
+  if (target !== undefined) {
+    // file:// has no auth-server to mint from, and drilling anyway would draw the wrong database's
+    // data under the right database's name. A clear refusal beats a silent lie.
+    if (!SERVED) {
+      // Named after what was CLICKED, not after what the switch resolved to: a raw name resolves to
+      // the default tenant, and telling the operator to mint a token for "the default one" when
+      // they asked for `car` is an answer to a question nobody asked.
+      const asked = databaseOf(p);
+      return showErr('this token is for database ' + (currentDb || 'the default one') +
+                     ' — mint one for ' + asked + ' (console-token.ts --database ' + asked + ')');
+    }
+    pendingDrill = p;
+    void switchDatabase(target);
+    return;
+  }
+
   for (const old of [...watched.keys()]) unlisten(old);
   watched.clear();
   watched.set(p, { expanded: true, subId: null, json: false });
@@ -1107,12 +1504,65 @@ function drillTo(path) {
 
 $('#roots-refresh').addEventListener('click', () => loadRoots(true));
 
-// A namespace is not something this system creates. It is the first segment of a path and it comes
-// into being on the first write under it — §1 stores nothing for null or {}, so an "empty namespace"
-// cannot exist. The editor already builds a top-level path when the parent is root, so this offers
-// the one route the tree cannot: root is never listenable (§3), which means no node on screen is
-// ever the place you could click "add" to make one.
-$('#roots-add').addEventListener('click', () => openEditor('add', ''));
+/**
+ * §5.19: create a DATABASE — a registry row, not a write.
+ *
+ * This used to open the node editor, because a database WAS the first segment of whatever path got
+ * written first: there was nothing to create, only data to put somewhere. That had three costs the
+ * registry removes — an owner could not hand an empty database to a team, a team that deleted
+ * everything deleted the database with it, and the usage panel had no row to draw for a database
+ * holding nothing (§1 stores nothing for null or {}, so "empty" was not a state that could exist).
+ *
+ * It is also what makes "only the owner creates databases" a rule at all: a rule needs a list to be
+ * checked against, and until now there was none.
+ */
+$('#roots-add').addEventListener('click', async () => {
+  /**
+   * §5.26: the name is also a POSTGRES SCHEMA and a NOTIFY channel, so the rule is stricter than a
+   * path segment — and the prompt says so BEFORE the click, because a database cannot be renamed or
+   * deleted (§5.19 gave declaring no inverse). A name refused server-side costs a round trip; a
+   * name ACCEPTED and then unusable is a registry row nobody can remove.
+   */
+  const name = prompt('New database name.\n\n'
+    + 'Lowercase letters, digits and underscores; may not start with a digit; at most 51 characters.\n'
+    + 'It becomes a Postgres schema name, and it cannot be renamed or deleted later.');
+  if (name === null) return;
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  /**
+   * §5.24 Gate C: the quota, optional and empty by default. Empty means the shard's number and
+   * KEEPS meaning it — the database follows the shard if the shard's number ever changes — which
+   * is why this asks for a blank rather than pre-filling 64 and freezing today's value into a row.
+   */
+  const q = prompt(`Write quota for "${trimmed}", in lock acquisitions per second.\n\n`
+    + 'Leave blank for the shard default. One burst of any size is ONE acquisition, so this is not '
+    + 'a writes-per-second number.');
+  if (q === null) return;
+  const quotaAcqPerSec = q.trim() === '' ? null : Number(q.trim());
+  if (quotaAcqPerSec !== null && (!Number.isInteger(quotaAcqPerSec) || quotaAcqPerSec < 1)) {
+    alert('The quota must be a whole number of acquisitions per second, or blank for the default.');
+    return;
+  }
+  // Checked here too, so a bad name is a sentence rather than a round trip and a 400. The server
+  // checks it again — this is the affordance, that one is the rule (§5.9's own division).
+  if (!/^[a-z_][a-z0-9_]*$/.test(trimmed) || trimmed.length > 51) {
+    alert(`"${trimmed}" cannot be a database name.\n\n`
+      + 'Lowercase letters, digits and underscores only, not starting with a digit, at most 51 '
+      + 'characters — it becomes a Postgres schema name.');
+    return;
+  }
+  try {
+    const r = await fetch('/databases', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify(quotaAcqPerSec === null ? { name: trimmed } : { name: trimmed, quotaAcqPerSec }),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+    await loadRoots(true);
+  } catch (e) {
+    alert('could not create database: ' + (e && e.message ? e.message : e));
+  }
+});
 
 /**
  * §5.6: the root namespaces. Served by the ops auth-server, which proxies the gateway's ADMIN port —
@@ -1132,9 +1582,24 @@ async function loadRoots(manual) {
     const r = await fetch('/topnodes', { headers: { Authorization: 'Bearer ' + token } });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    declared = new Set(Array.isArray(d.declared) ? d.declared : []);
+    const learnedDefault = defaultDb === '' && typeof d.defaultDb === 'string' && d.defaultDb !== '';
+    defaultDb = typeof d.defaultDb === 'string' ? d.defaultDb : '';
+    declaredKnown = true;
+    // §5.24 Gate C: on the DEFAULT tenant the tile has no name to ask about until this answer
+    // arrives, so the first poll — which runs at sign-in, before this — hid it. Waiting a whole
+    // interval to draw the line for the database that holds everything is the same shape as the
+    // §5.22 F-3b window: a thing that cannot be decided yet, decided anyway.
+    if (learnedDefault && currentDb === null) void pollUsage();
     renderRoots(Array.isArray(d.names) ? d.names : []);
+    // §5.22 Gate F-3b: a drill that arrived before this answer did. Cleared BEFORE the call, so a
+    // `drillTo` that queues again (a second failure, say) replaces it rather than looping on it.
+    if (pendingDrill !== null) { const p = pendingDrill; pendingDrill = null; drillTo(p); }
   } catch (e) {
-    // A sidebar that cannot load must not take the console down with it.
+    // A sidebar that cannot load must not take the console down with it. `declared` and
+    // `declaredKnown` are deliberately LEFT as they were: a failed refresh is not news about which
+    // names are databases, and dropping the list would put a working console back into the window
+    // §5.22 Gate F-3b exists to close.
     note.hidden = false;
     note.textContent = 'unavailable';
     for (const b of [...aside.querySelectorAll('.root')]) b.remove();
@@ -1145,9 +1610,12 @@ function renderRoots(names) {
   const aside = $('#roots');
   const note = $('#roots-note');
   for (const b of [...aside.querySelectorAll('.root')]) b.remove();
-  if (!names.length) { note.hidden = false; note.textContent = 'no namespaces yet'; return; }
+  if (!names.length) { note.hidden = false; note.textContent = 'no databases yet'; return; }
   note.hidden = true;
-  const here = currentRoot().split('/')[0];
+  // §5.22 Gate F-2: the CONNECTION's database, not the watched root. They are the same thing while
+  // one console holds one database, and saying so from `currentRoot()` would make the highlight a
+  // guess drawn from what happens to be listened to.
+  const here = currentDb;
   for (const name of names) {
     const b = document.createElement('button');
     b.className = 'root';
@@ -1265,7 +1733,8 @@ $('#disconnect').onclick = () => {
   manualClose = true;
   clearTimeout(retryTimer); stopPings();
   if (ws) ws.close(1000, 'operator');
-  ws = null; epoch = null; subs.clear(); watched.clear(); mirror.dropServerState();
+  resetServerState();
+  pendingDrill = null;
   $('#s-subs').textContent = '0'; $('#s-epoch').textContent = '–'; $('#s-rev').textContent = '–';
   $('#connect-form').style.display = '';
   $('#connected-form').style.display = 'none';
@@ -1328,8 +1797,8 @@ if (SERVED) {
       // It carries the LOCALPART, not the subject: the localpart is unique by the rule that refuses
       // two users to share one (§5.8 F3), so it matches an audit line exactly — while nothing
       // token-shaped goes on screen during a screen-share.
-      const me = (d.sub || '').replace(/^console-(?:rw-)?/, '');
-      $('#mode-tag').textContent = (canWrite() ? 'rw · ' : 'read-only · ') + me;
+      myName = (d.sub || '').replace(/^console-(?:rw-)?/, '');
+      renderModeTag();
       startStats();
       $('#login').hidden = true;
       connect();
@@ -1673,6 +2142,13 @@ async function pollStats() {
     const lag = d.consumerLag?.[0]?.value ?? 0;
     $('#st-lag').textContent = fmtNum(lag);
     $('#st-lag').style.color = lag > 10_000 ? 'var(--warn)' : '';
+    // §5.22 Gate E. `/stats` has computed this on every poll since the gate landed and nothing
+    // rendered it — a query that runs, costs a round trip, and cannot be read is the UI shape of a
+    // test that cannot fail. Any non-zero is a page: `databasesWithoutOneLeader` already counts
+    // both directions, so this only has to decide plain or warn.
+    const leaderless = d.databasesWithoutOneLeader?.[0]?.value ?? 0;
+    $('#st-leaders').textContent = fmtNum(leaderless);
+    $('#st-leaders').style.color = leaderless > 0 ? 'var(--warn)' : '';
     $('#st-age').textContent = 'updated just now';
     $('#st-age').classList.remove('stale');
     $('#stats').hidden = false;
@@ -1683,10 +2159,67 @@ async function pollStats() {
   }
 }
 
+/**
+ * §5.24 Gate B: this database's usage line, polled with the stats strip.
+ *
+ * `currentDb` and nothing else — the tile is about ONE database, so there is no honest number to
+ * show before a database is chosen, and it stays hidden rather than showing a total that is not
+ * one. The DEFAULT tenant (`currentDb === null`) has no registry name to ask about, which is the
+ * same fact `switchTargetFor` already turns on: the panel bills declared databases.
+ */
+async function pollUsage() {
+  if (!SERVED || !authToken) return;
+  // §5.24 Gate C: `currentDb` is null on the DEFAULT tenant — a connection there carries no `ns` to
+  // name it by — but it is a database with numbers, and today it is production's entire dataset.
+  // `/topnodes` supplies the name; a gateway too old to send one leaves the tile hidden, as before.
+  const db = currentDb ?? defaultDb;
+  if (!db) { $('#usage').hidden = true; return; }
+  try {
+    const r = await fetch(`/usage?db=${encodeURIComponent(db)}`, {
+      headers: { authorization: `Bearer ${authToken}` },
+    });
+    if (!r.ok) {
+      if (r.status === 401) stopStats();
+      // A tile that cannot refresh keeps its last numbers and says they are old — the same rule the
+      // stats strip follows. Blanking them would lose the reading an operator is looking at.
+      $('#us-age').textContent = 'usage unavailable';
+      $('#us-age').classList.add('stale');
+      return;
+    }
+    const d = await r.json();
+    // Answered for a database we have since left: drop it. The next poll asks for the right one.
+    if (d.database !== (currentDb ?? defaultDb)) return;
+    const u = usageLines(d);
+    // Named AND labelled: `public` is a schema name, and an operator reading it on a bill needs to
+    // know it is the database a token with no `ns` lands on rather than one somebody created.
+    $('#us-db').textContent = currentDb === null ? `${d.database} (default)` : d.database;
+    $('#us-conns').textContent = u.connections;
+    $('#us-storage').textContent = u.storage;
+    $('#us-downloads').textContent = u.downloads;
+    $('#us-load').textContent = u.load;
+    $('#us-load').classList.toggle('warn', u.loadWarn);
+    $('#us-quota').textContent = u.quota;
+    // The quota is the reason a client's writes start failing, so when it is acting the tile says
+    // so where the Load number is — not in a log the client cannot read (§5.23).
+    $('#us-note').textContent = u.rejecting
+      ? 'This database is over its write quota and some writes are being refused (RATE). '
+        + 'Writes and storage are isolated per database; fanout CPU is not.'
+      : "Writes and storage are isolated per database. Fanout CPU is not — it is per gateway and "
+        + 'does not divide by database.';
+    $('#st-shard-load').textContent = u.shardLoad;
+    $('#us-age').textContent = 'updated just now';
+    $('#us-age').classList.remove('stale');
+    $('#usage').hidden = false;
+  } catch {
+    $('#us-age').textContent = 'usage unavailable';
+    $('#us-age').classList.add('stale');
+  }
+}
+
 function startStats() {
   if (!SERVED || statsTimer) return;
-  pollStats();
-  statsTimer = setInterval(pollStats, STATS_MS);
+  pollStats(); pollUsage();
+  statsTimer = setInterval(() => { pollStats(); pollUsage(); }, STATS_MS);
 }
 function stopStats() {
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
@@ -1710,8 +2243,11 @@ setState = function (s) {
     $('#stats').hidden = true;
     // The token is dead; so is anything it authorised. Put the panel away rather than leaving a
     // button that can only produce 401s.
-    myRole = ''; $('#users-btn').hidden = true; $('#users').hidden = true;
+    myRole = ''; myName = ''; currentDb = null; pendingDrill = null; switching = false;
+    declared = new Set(); declaredKnown = false; defaultDb = '';
+    $('#users-btn').hidden = true; $('#users').hidden = true;
     $('#roots-add').hidden = true;
+    $('#usage').hidden = true;
     $('#mode-tag').textContent = 'read-only';
     $('#edit').hidden = true;
     $('#login').hidden = false;

@@ -3,7 +3,7 @@
  *
  *   RTDB_DEV_SECRET=... node --import tsx scripts/console-token.ts --name asha   # local gateway
  *   node --import tsx scripts/console-token.ts --name asha [--role owner] [--hours 1]
- *                                              [--profile rtdb-deploy]            # the deployment
+ *                                              [--database chat] [--profile rtdb-deploy]
  *
  * The point is the habit, not the cryptography: without this, an operator opening the console
  * reaches for whatever token is nearest, and the nearest one is long-lived and production. This
@@ -15,6 +15,23 @@
  * /users check; a token minted without one is refused by all three, which is exactly what keeps a
  * device's shadow token from reading the fleet.
  *
+ * WHAT THIS MINTS IS READ-ONLY ON THE DATA PATH, AND `--role owner` DOES NOT CHANGE THAT.
+ * `consoleWriteDenied` (`src/pipeline/rules.ts`) demands TWO things of a console write, not one: a
+ * write role AND the subject prefix `console-rw-`, which is the deliberate unlock `/login` mints for
+ * editor and owner (`auth-server.mjs`: `console-${WRITE_ROLES.has(role) ? 'rw-' : ''}…`). This
+ * script only ever builds `console-<name>`, so its token reads the whole tree — sidebar, panel,
+ * /usage, /topnodes — and every `put` comes back `RULES`, however owner-ish the role claim looks.
+ * That is deliberate, not a gap: a token minted from a shell for a look around should not be able to
+ * edit production, and the one credential that can write is the one a human logged in for. The
+ * witness is `test/integration/console-write.test.ts` — "the role alone is not enough: editor on a
+ * plain console- subject is refused"; it names editor, and owner takes the same branch because the
+ * missing `rw-` prefix already decides it, whatever the role.
+ *
+ * So: for reading, use it. To WRITE as the console, log in to the console. If you genuinely need a
+ * writing token from here, `--name rw-<who>` produces `console-rw-<who>` and, with an editor or
+ * owner role, passes the gate — spelled out because it is the kind of thing that gets rediscovered
+ * as a bug at 3am, and because it means the `--name` flag is load-bearing beyond attribution.
+ *
  * The secret comes from RTDB_DEV_SECRET when it is set, and from SSM otherwise — so this works
  * against a local gateway with no AWS at all, and against the deployment when you have the profile.
  * Either way it is never written anywhere: not to a file, not to the shell history, not into the
@@ -22,6 +39,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { signDevToken } from '../src/gateway/auth.ts';
+import { DEFAULT_LIMITS } from '../src/protocol/limits.ts';
+import { validateDatabaseName } from '../src/protocol/path.ts';
 
 const flag = (name: string): string | undefined => {
   const i = process.argv.indexOf(`--${name}`);
@@ -30,7 +49,7 @@ const flag = (name: string): string | undefined => {
 
 const name = flag('name');
 if (!name || !/^[a-z0-9][a-z0-9_-]*$/i.test(name)) {
-  console.error('usage: console-token.ts --name <who> [--hours 1] [--profile rtdb-deploy]');
+  console.error('usage: console-token.ts --name <who> [--hours 1] [--database chat] [--profile rtdb-deploy]');
   console.error('  --name identifies the human, so a leaked token is attributable and kickable.');
   process.exit(2);
 }
@@ -44,6 +63,21 @@ if (!Number.isFinite(hours) || hours <= 0 || hours > 24) {
 const role = flag('role') ?? 'owner';
 if (!['owner', 'editor', 'viewer'].includes(role)) {
   console.error(`--role must be owner, editor or viewer; got "${role}"`);
+  process.exit(2);
+}
+
+/**
+ * §5.22 Gate F: which DATABASE this token is for. Omitted is the correct spelling of "the default
+ * tenant" — `rules.ts` reads an absent `ns` as "names no database", and an empty one is refused
+ * outright by `auth.ts`, so this is a claim that is either present and real or not there at all.
+ *
+ * The served console mints these itself through `POST /wire-token`. This flag is the file:// path
+ * and RUNBOOK §7c recovery, where there is no auth-server to ask.
+ */
+const database = flag('database');
+const badDb = database === undefined ? null : validateDatabaseName(database, DEFAULT_LIMITS);
+if (badDb) {
+  console.error(`--database ${database}: ${badDb}`);
   process.exit(2);
 }
 
@@ -85,5 +119,10 @@ if (!secret) {
 
 const exp = Math.floor(Date.now() / 1000) + Math.round(hours * 3600);
 // stderr, so `console-token.ts --name x | pbcopy` copies the token and nothing else.
-console.error(`console token for "console-${name}" as ${role}, expires ${new Date(exp * 1000).toISOString()} (${hours}h)`);
-process.stdout.write(`${signDevToken({ sub: `console-${name}`, exp, role }, secret)}\n`);
+console.error(
+  `console token for "console-${name}" as ${role} on ${database ?? 'the default database'}, ` +
+    `expires ${new Date(exp * 1000).toISOString()} (${hours}h)`,
+);
+process.stdout.write(
+  `${signDevToken({ sub: `console-${name}`, exp, role, ...(database ? { ns: database } : {}) }, secret)}\n`,
+);

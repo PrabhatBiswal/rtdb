@@ -35,7 +35,7 @@
             "type": "prometheus",
             "uid": "rtdb-prom"
           },
-          "expr": "rtdb_connections",
+          "expr": "sum by (instance) (rtdb_connections)",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -384,7 +384,7 @@
             "type": "prometheus",
             "uid": "rtdb-prom"
           },
-          "expr": "max_over_time(rtdb_consumer_lag_revs[$__interval])",
+          "expr": "max by (instance) (max_over_time(rtdb_consumer_lag_revs[$__interval]))",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -441,7 +441,7 @@
             "type": "prometheus",
             "uid": "rtdb-prom"
           },
-          "expr": "rtdb_leader",
+          "expr": "sum by (instance) (rtdb_leader)",
           "legendFormat": "leader {{instance}}",
           "refId": "A"
         },
@@ -450,7 +450,7 @@
             "type": "prometheus",
             "uid": "rtdb-prom"
           },
-          "expr": "rtdb_publishing",
+          "expr": "sum by (instance) (rtdb_publishing)",
           "legendFormat": "publishing {{instance}}",
           "refId": "B"
         }
@@ -857,6 +857,279 @@
         "legend": {
           "displayMode": "list",
           "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Lock acquisitions/s by database (the quota unit)",
+      "description": "\u00a75.23: the shard resource, and what a quota is denominated in \u2014 one per group commit, one per solo CAS. NOT writes: `scripts/quota-unit.ts` measures writes/acquisition from 1.00 (a trickle) to 500.00 (one burst), so a writes/second number prices two identical bills 500x apart. The measured ceiling is ~129 acq/s per shard (P2: `rev_counter ... FOR UPDATE` held \u2265 7.74ms), which is the line to read this against. Per gateway \u2014 sum both to get the shard. `_other` means the 64-database cap was hit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rtdb-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rtdb-prom"
+          },
+          "expr": "sum by (db) (rate(rtdb_lock_acquisitions_total[1m]))",
+          "legendFormat": "{{db}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Quota rejections/s by database",
+      "description": "\u00a75.23 Gate B refuses a write with `RATE` / `database quota exceeded` once a database is over its share. ZERO is the normal reading and the series exists at zero from the moment a database is served \u2014 a counter that appears only when it is non-zero cannot be alerted on before the incident it would announce. Non-zero means one database is being held to its share, not that the shard is failing. The bucket is PER GATEWAY (quota/`RTDB_GATEWAY_COUNT`), so an app whose connections all land on one gateway sees its share, not the whole quota.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rtdb-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rtdb-prom"
+          },
+          "expr": "sum by (db) (rate(rtdb_quota_rejected_total[1m]))",
+          "legendFormat": "{{db}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Downloads by database (before TLS)",
+      "description": "\u00a75.24: bytes handed to client sockets \u2014 frame text + WebSocket header \u2014 per database. EXACT for what this gateway sent the NLB, and deliberately NOT the egress bill: TLS and TCP happen on the NLB and are not observable from inside the process. Measured (\u00a75.22), the bill is 1.00x this for snapshot-shaped traffic and up to 1.24x for a drip of small deltas, before ~40B/packet of IP+TCP header. Cross-check the shard total against the NLB's ProcessedBytes in CloudWatch. `_none` is frames sent before hello picked a database. This supersedes rtdb_bytes_out_total for billing: that one counts payload only, missed every ack/err/pong, and never counted a batch envelope.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rtdb-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rtdb-prom"
+          },
+          "expr": "sum by (db) (rate(rtdb_wire_bytes_out_total[1m]))",
+          "legendFormat": "{{db}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Storage by database",
+      "description": "\u00a75.24: live data per database \u2014 the `nodes` relation only, so the oplog (\u00a79 retention: 2h or 500k revs, ours not the client's) is excluded. pg_total_relation_size INCLUDES indexes and TOAST, so this is larger than the JSON a client thinks they stored and is the right number for what the database costs on disk. One catalogue query for every tenant at once, cached 30s \u2014 a scrape does not become N round trips. A DECLARED database with no data reads 0 rather than vanishing (\u00a75.19). Aggregated with `max by (db)` because EVERY gateway reports the same shard-wide gauge \u2014 unaggregated it draws one identical series per gateway, which is the same \"written for a fleet of one\" mistake the Load panel made (\u00a75.25 Gate 3).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rtdb-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rtdb-prom"
+          },
+          "expr": "max by (db) (rtdb_storage_bytes)",
+          "legendFormat": "{{db}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Load by database (rho = acquisitions/s x hold)",
+      "description": "\u00a75.24: the fraction of the shard's lock a database is holding. rho = acquisitions/s x S, with S the measured hold from rtdb_lock_hold_ms (P2: 7.74ms for `rev_counter ... FOR UPDATE`), exported as a metric so this arithmetic is auditable from the same scrape as its inputs. It is scraped from EVERY gateway, so it is collapsed with scalar(max(...)) \u2014 an on()/group_left() join against it fails outright on a fleet of more than one (found on production, \u00a75.25 Gate 3). Warn at 0.8 and read it the way Firebase does \u2014 a database approaching 100% is one that will start seeing RATE. PER GATEWAY: sum both gateways for the shard. WHAT THIS DOES NOT COVER: fanout CPU is per-gateway and does not divide by database, so a shard can be in trouble with every line here green.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rtdb-prom"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rtdb-prom"
+          },
+          "expr": "sum by (db) (rate(rtdb_lock_acquisitions_total[1m])) * scalar(max(rtdb_lock_hold_ms)) / 1000",
+          "legendFormat": "{{db}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ],
           "showLegend": true
         },
         "tooltip": {

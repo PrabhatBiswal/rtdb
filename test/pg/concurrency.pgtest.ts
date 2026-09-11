@@ -16,8 +16,9 @@ after(() => db.drop());
 const put = (path: string, value: unknown): GroupWrite =>
   ({ writeId: randomUUID(), path, op: 'put', value: value as never });
 
-test('parallel group commits: revs stay gap-free, and each batch gets a contiguous range', async () => {
+test('parallel group commits: revs stay gap-free, and each batch gets a contiguous range', async (t) => {
   const s = db.make();
+  t.after(() => s.close());
   const BATCHES = 12;
   const PER_BATCH = 3;
   await warmPool(s, BATCHES);
@@ -50,8 +51,9 @@ test('parallel group commits: revs stay gap-free, and each batch gets a contiguo
   assert.deepEqual(oplog.map((e) => e.rev), all);
 });
 
-test('concurrent CAS on one path, one expectedRev: exactly one winner (§4 step 3)', async () => {
+test('concurrent CAS on one path, one expectedRev: exactly one winner (§4 step 3)', async (t) => {
   const s = db.make();
+  t.after(() => s.close());
   await s.commitGroup([put('p/score', 0)]); // rev 1
   const RACERS = 12;
   await warmPool(s, RACERS);
@@ -102,11 +104,18 @@ test('CAS racing a put on the same path never commits over an unseen write', asy
       assert.ok(conflicting.length > 0, `round ${round}: casFail must be justified by a real relevant write`);
     }
     assert.equal(await s.head(), cas.ok ? 3 : 2, `round ${round}: no rev may be burned by the loser`);
+    // Each round wants a FRESH store, and `helper.ts` only closes them when the FILE ends — so 20
+    // rounds sat on 20 warmed pools at once. Measured with a 100 ms sampler: this file ALONE peaked
+    // at 61 client backends of a usable 97 (`max_connections` 100 − 3 reserved), and
+    // `--test-concurrency=4` runs three more files beside it. That is the whole of the run-to-run
+    // `53300 too many clients`. The round is over; so is its store.
+    await s.close();
   }
 });
 
-test('one writeId, two connections at once: one rev, identical acks (§4 step 4)', async () => {
+test('one writeId, two connections at once: one rev, identical acks (§4 step 4)', async (t) => {
   const s = db.make();
+  t.after(() => s.close());
   await s.commitGroup([put('seed', 0)]); // rev 1
   const writeId = randomUUID();
   const RACERS = 8;
@@ -127,8 +136,9 @@ test('one writeId, two connections at once: one rev, identical acks (§4 step 4)
   assert.equal((await s.readSnapshot('p/score')).value, 42, 'and it must be applied exactly once');
 });
 
-test('a CAS interleaved with group commits keeps the oplog gap-free and ordered', async () => {
+test('a CAS interleaved with group commits keeps the oplog gap-free and ordered', async (t) => {
   const s = db.make();
+  t.after(() => s.close());
   await s.commitGroup([put('p/score', 0)]); // rev 1
   await warmPool(s, 8);
 

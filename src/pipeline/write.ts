@@ -3,7 +3,7 @@ import type { Limits } from '../protocol/limits.ts';
 import { joinPath } from '../protocol/path.ts';
 import type { GroupWrite, StorageAdapter } from '../storage/adapter.ts';
 import { flatten } from '../storage/tree.ts';
-import { consoleWriteDenied, type Rules } from './rules.ts';
+import { consoleWriteDenied, outsideOwnDatabase, type Rules } from './rules.ts';
 
 /**
  * §5.11: how many times a rejected commit is retried before the batch is abandoned. THREE, where
@@ -23,6 +23,8 @@ export interface Submission {
   userId: string;
   /** The connection's console role (§5.8). Null or absent for app tokens. */
   role?: string | null;
+  /** The connection's database claim (§5.20 Phase 1). Null or absent for an unscoped token. */
+  ns?: string | null;
   reply: (frame: ServerFrame) => void;
 }
 
@@ -46,6 +48,61 @@ export class RateLimiter {
     if (this.#tokens < 1) return false;
     this.#tokens -= 1;
     return true;
+  }
+}
+
+/**
+ * §9/§5.23: lock acquisitions per DATABASE. Same token math as `RateLimiter` above, and a separate
+ * class rather than a parameter on it — that one has 38 call sites and a contract this would not
+ * fit, because the two differ in shape and not only in numbers:
+ *
+ *  - `RateLimiter.take()` decides and spends in one call, because a connection's write is refused
+ *    or admitted right there;
+ *  - this is a DEBIT. The cost is not known when the write arrives — a put that rides a batch
+ *    costs a five-hundredth of an acquisition and the same put arriving alone costs a whole one —
+ *    so the charge lands at COMMIT (`WritePipeline`'s `onAcquire`) and admission reads the balance
+ *    that charging left behind.
+ *
+ * The bucket therefore goes NEGATIVE, and that is the honest shape rather than a defect: writes
+ * already submitted when the balance ran out still commit and still charge. The overshoot is
+ * bounded by what one `GROUP_COMMIT_MS` window can hold — the pipeline batches, so it is one batch
+ * in flight, not an unbounded queue — and the debt is paid back by the same refill that would have
+ * accrued anyway. Hiding that with a clamp would let a database spend past its share for free.
+ */
+export class AcquisitionQuota {
+  #tokens: number;
+  #last: number;
+
+  constructor(
+    private readonly perSec: number,
+    private readonly burst: number,
+    now: number = Date.now(),
+  ) {
+    this.#tokens = burst;
+    this.#last = now;
+  }
+
+  #refill(now: number): void {
+    // Capped at the top only. The floor is deliberately open — see the debt note above.
+    this.#tokens = Math.min(this.burst, this.#tokens + ((now - this.#last) / 1000) * this.perSec);
+    this.#last = now;
+  }
+
+  /** One lock acquisition, charged AFTER the fact. */
+  charge(now: number = Date.now()): void {
+    this.#refill(now);
+    this.#tokens -= 1;
+  }
+
+  /** May another write be admitted? Refused at a balance of zero or less, never at a fraction. */
+  allows(now: number = Date.now()): boolean {
+    this.#refill(now);
+    return this.#tokens > 0;
+  }
+
+  /** For tests and for the debt note: what is left, negative when the database is over. */
+  get balance(): number {
+    return this.#tokens;
   }
 }
 
@@ -75,6 +132,19 @@ export class WritePipeline {
     private readonly auditConsoleWrite?: (fields: Record<string, unknown>) => void,
     /** U3-shaped, bounded: one line when a batch is abandoned. See §5.11. */
     private readonly log?: (ev: string, fields: Record<string, unknown>) => void,
+    /**
+     * §5.23 Gate A: called once per LOCK ACQUISITION — every `commitGroup`, every solo `commitCas`,
+     * and once more for each retry, because a retried transaction takes the lock again.
+     *
+     * A callback rather than a metric import, for the reason `log` above is one: this class knows
+     * about §4 and nothing else, and the `db` a counter needs is the caller's fact, not its own.
+     * It is also where Gate B's debit lands, so the charge happens at COMMIT and not at submit —
+     * at submit nobody knows yet whether the write will ride a batch or go alone, which is the
+     * whole 1.00-vs-500.00 spread the unit exists to price.
+     */
+    private readonly onAcquire?: () => void,
+    /** §5.20 Phase 1: refuse a token that names no database. See `outsideOwnDatabase`. */
+    private readonly requireNs = false,
   ) {}
 
   submit(s: Submission): void {
@@ -121,6 +191,19 @@ export class WritePipeline {
       });
     }
     if (denied) return { code: 'RULES', msg: 'this console session may not write' };
+    // §5.20 Phase 1, and in the same position and for the same reason as the line above it: before
+    // the configured rules, and not reachable by them.
+    if (
+      outsideOwnDatabase({
+        userId: s.userId,
+        ns: s.ns ?? null,
+        role: s.role ?? null,
+        path: f.path,
+        requireNs: this.requireNs,
+      })
+    ) {
+      return { code: 'RULES', msg: 'write outside this token\'s database' };
+    }
     if (!this.rules({ userId: s.userId, role: s.role ?? null, op: f.type, path: f.path, value: f.value })) {
       return { code: 'RULES', msg: 'write denied' };
     }
@@ -210,7 +293,10 @@ export class WritePipeline {
       op: s.frame.type as 'put' | 'merge',
       value: s.frame.value,
     }));
-    const acks = await this.#commit(() => this.storage.commitGroup(writes), {
+    const acks = await this.#commit(() => {
+      this.onAcquire?.();
+      return this.storage.commitGroup(writes);
+    }, {
       writes: writes.length,
       paths: writes.length === 1 ? writes[0]?.path : undefined,
     });
@@ -225,13 +311,17 @@ export class WritePipeline {
   async #runCas(s: Submission): Promise<void> {
     const f = s.frame as Extract<WriteFrame, { type: 'cas' }>;
     const r = await this.#commit(
-      () =>
-        this.storage.commitCas({
+      () => {
+        // §4: a CAS commits SOLO, so this is one acquisition for one write — the expensive end of
+        // the unit, and the reason a writes/second quota cannot see the cost at all.
+        this.onAcquire?.();
+        return this.storage.commitCas({
           writeId: f.writeId,
           path: f.path,
           expectedRev: f.expectedRev,
           value: f.value,
-        }),
+        });
+      },
       { writes: 1, paths: f.path },
     );
     if (r === null) return; // abandoned and logged; see #commit

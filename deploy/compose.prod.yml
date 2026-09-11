@@ -25,6 +25,18 @@ x-gateway: &gateway
     RTDB_PG_URL: postgres://rtdb:rtdb@postgres:5432/rtdb
     RTDB_REDIS_URL: redis://redis:6379
     RTDB_SHARD: 0
+    # §5.19's fail-closed guard, and the same value production runs: without it `main.ts` refuses to
+    # boot on Postgres, so this file could not rehearse the production shape at all — which is how
+    # §5.25 found that `rules/` was missing from the image (`Dockerfile`: COPY rules ./rules).
+    RTDB_RULES: rules/allow-all.ts
+    # TWO gateways in this file, so the shard's quota (64/128) is divided by two, exactly as
+    # production does it (§5.23 faisla 5) — 32/64 each. Rehearsing with the production number
+    # would rehearse a fleet of one.
+    RTDB_GATEWAY_COUNT: 2
+    # §5.26: a database per Postgres SCHEMA, chosen by the token's `ns` at hello. This file is where
+    # that gets rehearsed before production — two gateways on one shard is the only arrangement that
+    # shows the per-database bus keys and the two leader series.
+    RTDB_MULTI_TENANT: 1
     # Deploy-review numbers (WORKLOAD §2) — PROPOSED here, ruled at Gate C. Reasoning in the report.
     RTDB_PRUNE_MS: 300000
   depends_on:

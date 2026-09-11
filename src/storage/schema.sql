@@ -1,5 +1,10 @@
 -- §8's schema, applied idempotently at startup into the connection's search_path schema.
 -- No migration framework: CREATE ... IF NOT EXISTS is the whole story for v1 (WORKLOAD §2).
+--
+-- EVERY TABLE HERE BELONGS TO ONE TENANT. §5.22 Gate A: the `databases` registry used to live here
+-- too, and that was wrong for the same reason it was invisible — one schema per tenant would have
+-- put the list of ALL tenants inside ONE of them. It is now created by `CONTROL_SQL` in
+-- postgres.ts, into the shard's control schema, which is the one schema no tenant owns.
 
 CREATE TABLE IF NOT EXISTS oplog (
   rev      BIGINT PRIMARY KEY,

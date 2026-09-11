@@ -2,7 +2,7 @@ import { randomInt } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import type { Json } from '../protocol/frames.ts';
 import { DEFAULT_LIMITS, type Limits } from '../protocol/limits.ts';
-import { ancestorsInclusive, isAncestorOrEqual, isRelevant, joinPath } from '../protocol/path.ts';
+import { ancestorsInclusive, isAncestorOrEqual, isRelevant, joinPath, validateDatabaseName } from '../protocol/path.ts';
 import type {
   AckResult,
   CasResult,
@@ -30,6 +30,9 @@ interface Node {
 export class MemoryStorage implements StorageAdapter {
   /** Flattened leaf paths -> value + the rev that last wrote them. Kept prefix-free. */
   readonly #nodes = new Map<string, Node>();
+  /** §5.19's declared databases — those that exist because someone said so, not because of data. */
+  /** §5.24 Gate C: the registry, and each row's quota override — `null` is "the shard default". */
+  readonly #declared = new Map<string, { quotaAcqPerSec: number | null }>();
   readonly #oplog: OplogEntry[] = [];
   readonly #writeIds = new Map<string, number>();
   readonly #listeners = new Set<() => void>();
@@ -52,6 +55,11 @@ export class MemoryStorage implements StorageAdapter {
   constructor(
     private readonly limits: Limits = DEFAULT_LIMITS,
     private readonly persistPath?: string,
+    /**
+     * §5.24: which database this store IS, so `storageBytes` can key its answer. Empty unless a
+     * gateway said — nothing else in this class has ever needed to know, and it still does not.
+     */
+    private readonly name: string = '',
   ) {
     const persisted = persistPath && existsSync(persistPath) ? readFileSync(persistPath, 'utf8') : null;
     if (persisted !== null) {
@@ -72,10 +80,52 @@ export class MemoryStorage implements StorageAdapter {
     return Promise.resolve(this.#epoch);
   }
 
+  /** §5.19's registry. A Set is the whole implementation — this store does not outlive the process. */
+  declareDatabase(name: string, _by: string, quotaAcqPerSec?: number | null): Promise<void> {
+    // Same rule as the Postgres registry, and it must be the same or the conformance suite would be
+    // asserting two different ideas of a legal name (§5.22 Gate E).
+    const bad = validateDatabaseName(name, this.limits);
+    if (bad) return Promise.reject(new Error(`illegal database name: ${bad}`));
+    // Re-declaring is a no-op on the row, quota included — the same rule the Postgres registry's
+    // `ON CONFLICT DO NOTHING` states, and it must be the same or the two storages would disagree
+    // about whether a second declare can quietly reset somebody's override.
+    if (!this.#declared.has(name)) this.#declared.set(name, { quotaAcqPerSec: quotaAcqPerSec ?? null });
+    return Promise.resolve();
+  }
+
+  /** §5.24 Gate C: the registry row, or null for a name nobody declared (the default tenant). */
+  describeDatabase(name: string): Promise<{ quotaAcqPerSec: number | null } | null> {
+    return Promise.resolve(this.#declared.get(name) ?? null);
+  }
+
+  /**
+   * §5.24: this store's live size, approximated as the JSON its leaves would serialize to — path
+   * plus value, which is what the client put in and what a snapshot would send back. It is an
+   * approximation and says so: a `Map` entry's real cost is V8's business, and nothing here is
+   * billed anyway. Postgres answers this from the catalogue, exactly, and that is the one that
+   * matters.
+   *
+   * Keyed by `name`, which is empty unless a gateway said which database this store is — a single
+   * entry either way, because one `MemoryStorage` IS one database.
+   */
+  storageBytes(): Promise<Record<string, number>> {
+    let bytes = 0;
+    for (const [path, node] of this.#nodes) {
+      bytes += Buffer.byteLength(path, 'utf8') + Buffer.byteLength(JSON.stringify(node.value ?? null), 'utf8');
+    }
+    return Promise.resolve({ [this.name]: bytes });
+  }
+
+  /** §5.22 Gate D: the registry alone. The Set IS the registry here, so this is it, sorted. */
+  listDeclared(): Promise<string[]> {
+    return Promise.resolve([...this.#declared.keys()].sort());
+  }
+
   /** §5.6's sidebar. One pass over the leaf map: in memory there is no index to skip along, and
-   *  nothing here holds a shard big enough for that to matter. */
+   *  nothing here holds a shard big enough for that to matter. Union with the declared names, for
+   *  the same reason Postgres does it — a namespace with no data yet is still a namespace. */
   topNodes(): Promise<string[]> {
-    const names = new Set<string>();
+    const names = new Set<string>(this.#declared.keys());
     for (const path of this.#nodes.keys()) names.add(path.split('/', 1)[0] as string);
     return Promise.resolve([...names].sort());
   }

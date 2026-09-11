@@ -126,6 +126,24 @@ const STORE_DIR = process.env.CONSOLE_STORE_DIR;
 const localFile = (name) => join(STORE_DIR, name.replace(/^\//, '').replace(/\//g, '_') + '.json');
 /** §2.3: 24h. Longer than a console token because a device fetches one per app start, not per view. */
 const SHADOW_HOURS = Number(process.env.SHADOW_HOURS ?? 24);
+
+/**
+ * §5.20 Phase 1: how long an ns-scoped app token lives. A week, not a year.
+ *
+ * Expiry is HALF of revocation, and only the half that covers connections not yet made. §2 validates
+ * a token ONCE, at connect, so a socket that is already established outlives its own `exp` — the
+ * other half is §10's kick, which is why `sub` below is shaped `app-<database>-<slug>`: a kick
+ * targets a userId string, so app subjects have to be nameable as a class. Both halves, or it is not
+ * revocation. `RUNBOOK.md §7d` carries the operator side of this.
+ *
+ * With no deny list anywhere, this number IS the blast radius of a leaked token for every NEW
+ * connection it makes.
+ *
+ * ponytail: expiry plus a manual kick. A deny list (or a per-database key version the gateway
+ * checks at connect) is what turns this into a knob instead of a ceiling; write it when a token
+ * actually leaks, or when a client asks to rotate one without waiting a week.
+ */
+const APP_TOKEN_HOURS = Number(process.env.APP_TOKEN_HOURS ?? 24 * 7);
 // The single origin the page is allowed to open a socket to. One value, one allowlist entry.
 const WSS_ORIGIN = process.env.CONSOLE_WSS ?? 'ws://127.0.0.1:8080';
 const MAX_FAILS = 5;
@@ -161,11 +179,75 @@ const PROM = process.env.PROM_URL ?? 'http://127.0.0.1:9090';
  * PromQL endpoint on the open internet.
  */
 const QUERIES = {
-  connections: 'rtdb_connections',
+  // §5.22 Gate E labelled these by `db`, so the per-gateway strip has to aggregate the label away
+  // or it reports one database's number as a gateway's. `sum by (instance)` is what the panel meant
+  // before the label existed, said out loud. Per-database lines are Phase 4's usage panel, not this
+  // strip — this one answers "is the fleet healthy", and that is a fleet-shaped question.
+  connections: 'sum by (instance) (rtdb_connections)',
   connectionsTotal: 'sum(rtdb_connections)',
   writesPerSec: 'sum(rate(rtdb_writes_total[1m]))',
   consumerLag: 'max(rtdb_consumer_lag_revs)',
+  /**
+   * §5.22 Gate E. `rtdb_leader` carries a `db` label now and every panel sums it away, so the old
+   * "two gateways at leader=1 is a split brain" check has to be asked PER DATABASE or it vanishes
+   * with the label — which would be this gate's own kind of silent failure.
+   *
+   * COUNTING the broken ones, not taking a max. `max(sum by (db) (rtdb_leader))` reads 1 when one
+   * database has two leaders and another has none — it only ever shows the failure from above, and
+   * a database with NO publisher is the half that stops deltas. This counts every database that is
+   * not on exactly one leader, in either direction. `or vector(0)` because a healthy fleet makes
+   * `!= 1` match nothing, and an empty result would render as "no data" rather than as zero.
+   *
+   * A database missing from `rtdb_leader` altogether — no gateway has that tenant loaded at all —
+   * is a third failure that neither shape can see, and it stays RUNBOOK §7's job.
+   */
+  databasesWithoutOneLeader: 'count(sum by (db) (rtdb_leader) != 1) or vector(0)',
 };
+
+/**
+ * §5.24 faisla 5: ONE database's usage line — Firebase's four, plus Load.
+ *
+ * The same shape as `/stats` and for the same reason: a FIXED list of queries, none of which a
+ * caller can name, influence or add to. The only thing a caller supplies is the database, and it is
+ * not interpolated until it has been checked against the shard's REGISTRY — so this endpoint cannot
+ * become a PromQL selector on the open internet, which is the property `/stats` was built to keep.
+ *
+ * Registry, not `names` (§5.22 Gate F-3): a top-level namespace that merely has data is not a
+ * database anyone was handed, and the panel bills per database. It also keeps a second shard's
+ * schemas out of the answer when two shards share one Postgres database — `storageBytes` reads
+ * every `nodes` relation it can see, and only the registry knows which of them are OURS.
+ */
+const USAGE_QUERIES = (db) => ({
+  // Every connection ON this database, across the fleet. Console sessions included, and the tile
+  // says so: Firebase counts every connection too, and a console that hid its own would be lying
+  // about the number the client is billed on.
+  connections: `sum(rtdb_connections{db="${db}"}) or vector(0)`,
+  // A gauge, so no rate: the level right now. One gateway reports it, both report the same shard.
+  storageBytes: `max(rtdb_storage_bytes{db="${db}"}) or vector(0)`,
+  // BEFORE TLS — bytes handed to the socket. The tile carries the factor in words; no number here
+  // is multiplied by anything, because the multiplier is a property of traffic shape (§5.22).
+  downloadsPerSec: `sum(rate(rtdb_wire_bytes_out_total{db="${db}"}[5m])) or vector(0)`,
+  /**
+   * rho = acquisitions/s x hold. Summed across gateways, because the SHARD's lock is the resource.
+   *
+   * `scalar(max(...))` and NOT `on() group_left()`: `rtdb_lock_hold_ms` is scraped from EVERY
+   * gateway, so the right-hand side is one series per gateway and the join fails outright —
+   * `found duplicate series for the match group {}`. It is the same constant on each, so collapsing
+   * it to one number is the whole fix. Found on production at §5.25 Gate 3, where a two-gateway
+   * Prometheus is the first thing that ever evaluated this: the tests compute the arithmetic
+   * themselves rather than through PromQL, and a one-gateway rehearsal has nothing to duplicate.
+   */
+  load: `sum(rate(rtdb_lock_acquisitions_total{db="${db}"}[5m])) * scalar(max(rtdb_lock_hold_ms)) / 1000 or vector(0)`,
+  // Refusals, so a client can see the quota acting rather than guess from a stalled app.
+  quotaRejectedPerSec: `sum(rate(rtdb_quota_rejected_total{db="${db}"}[5m])) or vector(0)`,
+  // §5.24 Gate C: the rate this database is held to, and whether anybody chose it. `max` because
+  // every gateway reports the same shard-wide number; the `source` label rides along in `metric`.
+  quotaAcqPerSec: `max by (source) (rtdb_quota_acq_per_sec{db="${db}"})`,
+});
+
+/** The whole shard's Load, for the strip: the same arithmetic without the database filter. */
+const SHARD_LOAD =
+  'sum(rate(rtdb_lock_acquisitions_total[5m])) * scalar(max(rtdb_lock_hold_ms)) / 1000 or vector(0)';
 
 /**
  * §5.6's sidebar. The gateway answers `/topnodes` on its ADMIN port — never the public wire — and
@@ -179,7 +261,7 @@ const QUERIES = {
  * box already watches, or it gets an error.
  */
 const TOPNODES_TTL = 10_000;   // matches the gateway's window (ruling 2026-08-30)
-let topCache = { names: null, at: 0 };
+let topCache = { shard: null, at: 0 };
 
 async function gatewayAdminBase() {
   const r = await fetch(`${PROM}/api/v1/targets?state=active`, { signal: AbortSignal.timeout(4000) });
@@ -192,20 +274,86 @@ async function gatewayAdminBase() {
   return `http://${t.discoveredLabels.__address__}`;
 }
 
-async function topNodes() {
-  if (topCache.names && Date.now() - topCache.at < TOPNODES_TTL) return topCache.names;
+/**
+ * §5.22 Gate F-3: BOTH of the shard's lists, because they answer different questions.
+ *
+ * `names` is declared UNION derived — every top-level name that exists, which is what the SIDEBAR
+ * needs so nothing an operator holds is invisible. `declared` is the registry alone, which is what
+ * a MINT needs: after Gate D the gateway refuses an undeclared `ns` at hello, so a token minted for
+ * one of the default tenant's raw namespaces is a credential nobody can connect with.
+ *
+ * A gateway that predates this answers with `names` only; `declared` then reads as empty, and both
+ * mints refuse rather than hand out a token they cannot vouch for. That is the right direction to
+ * fail during a rolling deploy — a refusal an operator can read, not a 4401 ten seconds later.
+ */
+async function shard() {
+  if (topCache.shard && Date.now() - topCache.at < TOPNODES_TTL) return topCache.shard;
   const base = await gatewayAdminBase();
   const r = await fetch(`${base}/topnodes`, { signal: AbortSignal.timeout(4000) });
   if (!r.ok) throw new Error(`gateway topnodes ${r.status}`);
   const d = await r.json();
-  const names = Array.isArray(d?.names) ? d.names.filter((n) => typeof n === 'string') : [];
-  topCache = { names, at: Date.now() };
-  return names;
+  const strings = (v) => (Array.isArray(v) ? v.filter((n) => typeof n === 'string') : []);
+  // §5.24 Gate C: the default tenant's name. A gateway that predates this sends none, and the
+  // console then simply has no default tile — the same fail-closed direction `declared` takes.
+  const answer = {
+    names: strings(d?.names),
+    declared: strings(d?.declared),
+    defaultDb: typeof d?.defaultDb === 'string' ? d.defaultDb : '',
+  };
+  topCache = { shard: answer, at: Date.now() };
+  return answer;
+}
+
+/**
+ * §5.19: declare a database on the shard. Same discovered target as `topNodes`, same reasoning —
+ * a caller cannot name a host, a port or a path, only a name.
+ */
+async function declareDatabase(name, sub, quotaAcqPerSec) {
+  const base = await gatewayAdminBase();
+  const r = await fetch(`${base}/databases`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-rtdb-subject': sub },
+    // §5.24 Gate C: omitted rather than null when unset, so the gateway's own optional-field rule
+    // is what decides, in one place, instead of two layers each having an idea about it.
+    body: JSON.stringify(quotaAcqPerSec == null ? { name } : { name, quotaAcqPerSec }),
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!r.ok) {
+    /**
+     * §5.26: a 4xx from the gateway is the CLIENT being told something — an illegal name, most of
+     * all — and it was being turned into a 503 "unavailable", which says the shard is down. The
+     * operator then retries a name that can never work. Carry the gateway's status and its words.
+     *
+     * The name rule itself is NOT copied here. It lives in `src/protocol/path.ts` and the gateway's
+     * admin route enforces it; this file has no build step and no `src/` import, so a second regex
+     * here would be the exact "two ideas of a legal name" that made `LightingMacQueen` declarable
+     * and unusable in the first place. One rule, one home, and this hop reports its answer.
+     */
+    const body = await r.json().catch(() => ({}));
+    const e = new Error(body.error || `gateway databases ${r.status}`);
+    e.status = r.status;
+    throw e;
+  }
+  // The list this box just answered from is now stale by construction, and the operator is about to
+  // look at it. Ten seconds of "your database is not there" reads exactly like a broken button.
+  topCache = { shard: null, at: 0 };
 }
 
 const scryptAsync = promisify(scrypt);
 const execFileAsync = promisify(execFile);
-const HTML = readFileSync(HTML_PATH, 'utf8');
+/**
+ * §5.25 Gate 4: the served page's endpoint box is filled from `CONSOLE_WSS`, the SAME value the CSP
+ * allows. They were two independent facts and the mismatch is invisible — the browser refuses the
+ * socket before a byte leaves, the page says only "connecting", and nothing appears in the
+ * auth-server's log or the gateway's. That cost a rehearsal at §5.24 Gate B and the first riding-
+ * client run at §5.25 Gate 1, which aimed at the console's own host.
+ *
+ * One replacement of the file's default, which is the ONLY occurrence in the page — the file:// copy
+ * keeps that default, because opened as a file there is no server to ask and a local gateway is the
+ * right guess. Nothing else about the page changes shape.
+ */
+const HTML_FILE = readFileSync(HTML_PATH, 'utf8');
+const HTML = HTML_FILE.replace('value="ws://127.0.0.1:8080"', `value="${WSS_ORIGIN}"`);
 
 /** One audit line per attempt. Never the password, never the token — outcome, who, and from where. */
 const audit = (event, detail) =>
@@ -373,11 +521,18 @@ const b64u = (b) => Buffer.from(b).toString('base64url');
  *
  * `role` is omitted when there is none, which is exactly the shadow-token case: a device token is
  * not a console session and must not read like one.
+ *
+ * `ns` is omitted the same way, and for a sharper reason: `src/pipeline/rules.ts` reads an ABSENT
+ * `ns` as "this token names no database", which under `RTDB_REQUIRE_NS` is refused everywhere. An
+ * `ns: ''` or `ns: null` written into the body would be a claim that is present and empty, and
+ * `src/gateway/auth.ts` refuses the whole token for it. Omission is the only correct spelling of
+ * "unscoped", so it is the only one this can produce.
  */
-function mintToken(sub, secret, hours, role) {
+function mintToken(sub, secret, hours, role, ns) {
   const head = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const claims = { sub, exp: Math.floor(Date.now() / 1000) + Math.round(hours * 3600) };
   if (role) claims.role = role;
+  if (ns) claims.ns = ns;
   const body = b64u(JSON.stringify(claims));
   const mac = createHmac('sha256', secret).update(`${head}.${body}`).digest();
   return `${head}.${body}.${b64u(mac)}`;
@@ -511,6 +666,10 @@ async function promQuery(q) {
   return (d.data?.result ?? []).map((s) => ({
     instance: s.metric?.instance ?? null,
     az: s.metric?.az ?? null,
+    // §5.24 Gate C: the quota series carries `source` (default | override), which is the difference
+    // between "64, and it follows the shard" and "120, because somebody decided". Named labels
+    // only — the whole point of this flattening is that a caller never sees the raw payload.
+    source: s.metric?.source ?? null,
     value: Number(s.value?.[1] ?? 0),
   }));
 }
@@ -577,6 +736,53 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && url === '/usage') {
+    let secret;
+    try { ({ secret } = await credentials()); }
+    catch (e) {
+      audit('usage.ssm_error', { ip, msg: String(e).slice(0, 200) });
+      return json(res, 503, { error: 'unavailable' });
+    }
+    const who = consoleUser(req, secret);
+    if (!who) {
+      audit('usage.denied', { ip });
+      return json(res, 401, { error: 'sign in first' });
+    }
+    const db = new URL(req.url, 'http://x').searchParams.get('db') ?? '';
+    // Checked against the registry BEFORE it reaches a query string. This is the whole reason a
+    // caller-supplied value is safe here, so it is a refusal and not a filter.
+    let declared, defaultDb;
+    try { ({ declared, defaultDb } = await shard()); }
+    catch (e) {
+      audit('usage.error', { ip, sub: who.sub, msg: String(e).slice(0, 160) });
+      return json(res, 503, { error: 'unavailable' });
+    }
+    /**
+     * §5.24 Gate C: the registry UNION the default tenant.
+     *
+     * The default tenant is a database this shard serves and nobody declared — it is the schema the
+     * gateway was configured with — and today it holds production's entire dataset. Refusing it
+     * here left the one database with all the data as the only one with no usage line. The MINTS
+     * still take declared names only (§5.22 F-3): a token for the default tenant is a token with no
+     * `ns`, which is what a session already is. This endpoint reads numbers; it hands out nothing.
+     */
+    if (!declared.includes(db) && !(defaultDb && db === defaultDb)) {
+      audit('usage.unknown', { ip, sub: who.sub, database: db });
+      return json(res, 400, { error: 'no such database — declare it first' });
+    }
+
+    try {
+      const out = {};
+      const qs = USAGE_QUERIES(db);
+      await Promise.all(Object.entries(qs).map(async ([k, q]) => { out[k] = await promQuery(q); }));
+      out.shardLoad = await promQuery(SHARD_LOAD);
+      return json(res, 200, { at: Date.now(), database: db, ...out });
+    } catch (e) {
+      audit('usage.prom_error', { ip, sub: who.sub, msg: String(e).slice(0, 200) });
+      return json(res, 502, { error: 'metrics unavailable' });
+    }
+  }
+
   /** §5.6: the root namespaces, for the console's sidebar. Token-gated exactly like /stats. */
   if (req.method === 'GET' && url === '/topnodes') {
     let secret;
@@ -587,12 +793,181 @@ const server = createServer(async (req, res) => {
       return json(res, 401, { error: 'unauthorized' });
     }
     try {
-      return json(res, 200, { names: await topNodes() });
+      // Both lists (Gate F-3): the sidebar draws `names`, and the page needs `declared` to know
+      // which of those names is a DATABASE it can be handed a token for.
+      return json(res, 200, await shard());
     } catch (e) {
       // A sidebar that cannot load must not take the console down with it.
       audit('topnodes.error', { ip, msg: String(e).slice(0, 160) });
       return json(res, 503, { error: 'unavailable' });
     }
+  }
+
+  /**
+   * §5.19: create a database. WRITE role only — this is the client-owner's act, and the whole point
+   * of the registry is that a viewer (or an app) cannot perform it.
+   */
+  if (req.method === 'POST' && url === '/databases') {
+    let secret;
+    try { ({ secret } = await credentials()); }
+    catch { return json(res, 503, { error: 'credential store unavailable' }); }
+    const who = consoleUser(req, secret);
+    if (!who || !WRITE_ROLES.has(who.role)) {
+      audit('databases.denied', { ip, sub: who?.sub ?? null });
+      return json(res, 401, { error: 'unauthorized' });
+    }
+    let name, quotaAcqPerSec;
+    try { ({ name, quotaAcqPerSec } = JSON.parse((await readBody(req)) || '{}')); }
+    catch { return json(res, 400, { error: 'bad json' }); }
+    /**
+     * §5.29: the empty name goes to the GATEWAY, and its words come back. This used to answer
+     * `name required` here — a fourth sentence about legal names, living in the one file that
+     * documents (below) why it must not hold the rule. The gateway says `database name is
+     * required` (`src/protocol/path.ts:103`) and `:333` rethrows it, so all four reasons now read
+     * as one voice. `bad json` above STAYS ours: a malformed request body is this hop's own
+     * failure, not a statement about the name.
+     */
+    // §5.24 Gate C: optional. Shape-checked here so the console gets a readable 400 rather than the
+    // gateway's; the gateway checks it again, because this proxy is not the only way in.
+    if (quotaAcqPerSec != null && (!Number.isInteger(quotaAcqPerSec) || quotaAcqPerSec < 1 || quotaAcqPerSec > 100000)) {
+      return json(res, 400, { error: 'quota must be a whole number of acquisitions per second' });
+    }
+    try {
+      await declareDatabase(name, who.sub, quotaAcqPerSec);
+      audit('databases.created', { ip, sub: who.sub, name, quotaAcqPerSec: quotaAcqPerSec ?? null });
+      return json(res, 201, { name });
+    } catch (e) {
+      audit('databases.error', { ip, sub: who.sub, name, msg: String(e).slice(0, 160) });
+      // A refusal is the caller's answer; only a failure is ours (§5.26).
+      if (e.status >= 400 && e.status < 500) return json(res, e.status, { error: e.message });
+      return json(res, 503, { error: 'unavailable' });
+    }
+  }
+
+  /**
+   * §5.22 Gate F-3: the one check both mints make, and it is DECLARED, never `names`.
+   *
+   * `names` is declared UNION derived, so it includes the default tenant's own raw top-level
+   * namespaces. Since Gate D the gateway refuses an undeclared `ns` at hello (`server.ts`), which
+   * turned that laxness into a DEAD CREDENTIAL — a token minted for such a name is one nobody can
+   * connect with. For /app-token that credential has already been handed to somebody else, which is
+   * the worse half of it. The error text below was written before this and only now became true.
+   */
+  const mintable = async (database) => (await shard()).declared.includes(database);
+
+  /**
+   * §5.20 Phase 1: mint an app token confined to ONE database.
+   *
+   * This is what "the client gets a console" has to mean. The user's model is that the client hands
+   * a database to their dev team — if the console cannot mint that team's credential, the client
+   * needs a backend of their own to do it, and the sentence stops being true.
+   *
+   * WRITE role only, exactly like /databases above: handing out a credential is the owner's act, not
+   * a viewer's. And the database must already be one this shard knows about, which is the OTHER half
+   * of §5.20's inversion — the rule cannot refuse "a database that does not exist yet" (RuleCtx has
+   * no storage and is sync), so the refusal lives here instead, at the only point where a token for
+   * a never-declared name could be created.
+   */
+  if (req.method === 'POST' && url === '/app-token') {
+    let secret;
+    try { ({ secret } = await credentials()); }
+    catch { return json(res, 503, { error: 'credential store unavailable' }); }
+    const who = consoleUser(req, secret);
+    if (!who || !WRITE_ROLES.has(who.role)) {
+      audit('apptoken.denied', { ip, sub: who?.sub ?? null });
+      return json(res, 401, { error: 'unauthorized' });
+    }
+    let database, app;
+    try { ({ database, app } = JSON.parse((await readBody(req)) || '{}')); }
+    catch { return json(res, 400, { error: 'bad json' }); }
+    if (typeof database !== 'string' || !database) return json(res, 400, { error: 'database required' });
+
+    let ok;
+    try { ok = await mintable(database); }
+    catch (e) {
+      audit('apptoken.error', { ip, sub: who.sub, msg: String(e).slice(0, 160) });
+      return json(res, 503, { error: 'unavailable' });
+    }
+    if (!ok) {
+      // Not 404: whether a database exists is the client's business, and this endpoint already
+      // required a write role to reach, so there is nothing to leak. Say what is wrong.
+      audit('apptoken.unknown', { ip, sub: who.sub, database });
+      return json(res, 400, { error: 'no such database — declare it first' });
+    }
+
+    // The subject is derived, never taken from the body: §10's kick targets a userId string, and a
+    // caller that could choose its own subject could choose one that collides with a console
+    // session or another database's app. `deviceSlug` is the same untrusted-identifier squeeze
+    // /shadow-token already uses.
+    const slug = deviceSlug(app) || 'app';
+    const sub = `app-${database}-${slug}`;
+    audit('apptoken.minted', { ip, sub: who.sub, database, appSub: sub, expiresInHours: APP_TOKEN_HOURS });
+    return json(res, 201, {
+      token: mintToken(sub, secret, APP_TOKEN_HOURS, null, database),
+      sub,
+      database,
+      expiresInHours: APP_TOKEN_HOURS,
+    });
+  }
+
+
+  /**
+   * §5.22 Gate F-1: the CONSOLE's own wire credential, for ONE database.
+   *
+   * A console session token carries no `ns`, so it lands on the default tenant (`server.ts`'s hello
+   * chain) — and the console's sidebar happily lists every database on the shard. Click one and the
+   * old console sent `listen chat/rooms` down the SAME socket, which read `chat/rooms` inside the
+   * DEFAULT tenant's schema: empty, or worse, someone else's data at the same path. No error, ever,
+   * because `outsideOwnDatabase` exempts `console-` subjects everywhere.
+   *
+   * `helloAck` carries ONE rev and ONE epoch (§2), so one socket cannot serve two tenants. The
+   * routing key is already the token's `ns` (`server.ts` chooses the tenant from it, once, at
+   * hello), which is why this is a MINT and not a protocol change: the gateway does not move.
+   *
+   * The subject and role are the SESSION's, unchanged — `console-rw-asha` stays `console-rw-asha`.
+   * §10's kick targets a subject string and every audit line already names one; a per-database
+   * subject would silently split both. The only new claim is `ns`.
+   *
+   * A VIEWER may mint one, unlike /app-token: reading one database is what a viewer does, and
+   * §5.9's `consoleWriteDenied` is what stops them writing. `consoleUser` still demands a KNOWN
+   * role, which is the claim `outsideOwnDatabase`'s `console-` exemption costs (checkpoint R1) —
+   * strip the role from this token and its first listen is refused under `requireNs`.
+   */
+  if (req.method === 'POST' && url === '/wire-token') {
+    let secret;
+    try { ({ secret } = await credentials()); }
+    catch { return json(res, 503, { error: 'credential store unavailable' }); }
+    const who = consoleUser(req, secret);
+    if (!who) {
+      audit('wiretoken.denied', { ip, sub: null });
+      return json(res, 401, { error: 'unauthorized' });
+    }
+    let database;
+    try { ({ database } = JSON.parse((await readBody(req)) || '{}')); }
+    catch { return json(res, 400, { error: 'bad json' }); }
+    if (typeof database !== 'string' || !database) return json(res, 400, { error: 'database required' });
+
+    let ok;
+    try { ok = await mintable(database); }
+    catch (e) {
+      audit('wiretoken.error', { ip, sub: who.sub, msg: String(e).slice(0, 160) });
+      return json(res, 503, { error: 'unavailable' });
+    }
+    if (!ok) {
+      // Same refusal and same words as /app-token: this endpoint already required a console role to
+      // reach, so whether a database exists is not a secret from the caller.
+      audit('wiretoken.unknown', { ip, sub: who.sub, database });
+      return json(res, 400, { error: 'no such database — declare it first' });
+    }
+
+    audit('wiretoken.minted', { ip, sub: who.sub, database, expiresInHours: TOKEN_HOURS });
+    return json(res, 201, {
+      token: mintToken(who.sub, secret, TOKEN_HOURS, who.role, database),
+      sub: who.sub,
+      role: who.role,
+      database,
+      expiresInHours: TOKEN_HOURS,
+    });
   }
 
   if (req.method === 'POST' && url === '/login') {

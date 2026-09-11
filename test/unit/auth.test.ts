@@ -76,3 +76,32 @@ test('the dev secret comes from RTDB_DEV_SECRET and falls back to dev-secret', (
   if (prev === undefined) delete process.env['RTDB_DEV_SECRET'];
   else process.env['RTDB_DEV_SECRET'] = prev;
 });
+
+/**
+ * §5.20 Phase 1 — the `ns` claim, at the only place it is read off the wire.
+ *
+ * The shape of these mirrors the `role` tests above on purpose: `ns` is the second claim this
+ * validator carries, and the first one taught the lesson these pin. A malformed claim is REFUSED
+ * rather than dropped, because `outsideOwnDatabase` reads absence as "names no database" — so
+ * dropping a bad `ns` would silently widen a token instead of rejecting it.
+ */
+test('a valid ns claim is carried through, and a token without one carries no ns key', () => {
+  const ok = v.validate(signDevToken({ sub: 'app-car-web', ns: 'car', exp: future }, SECRET));
+  assert.deepEqual(ok, { ok: true, userId: 'app-car-web', ns: 'car' });
+  // No `ns` key at all, not `ns: undefined` — same standing proof the role tests rely on.
+  assert.deepEqual(v.validate(signDevToken({ sub: 'u_1', exp: future }, SECRET)), {
+    ok: true,
+    userId: 'u_1',
+  });
+});
+
+test('a malformed ns is refused, never dropped', () => {
+  // Empty is the dangerous one: `isAncestorOrEqual('', path)` is true for EVERY path, so an `ns: ''`
+  // that survived would be a token scoped to the whole tree while looking scoped.
+  rejects(signDevToken({ sub: 'u_1', ns: '', exp: future }, SECRET), /malformed token ns/);
+  rejects(signDevToken({ sub: 'u_1', ns: 42, exp: future }, SECRET), /malformed token ns/);
+  // A PATH is not a database. `ns: 'car/players'` would be a claim §1 accepts as a path and this
+  // must not: the product sells one top-level segment, and two grammars is how they drift apart.
+  rejects(signDevToken({ sub: 'u_1', ns: 'car/players', exp: future }, SECRET), /malformed token ns/);
+  rejects(signDevToken({ sub: 'u_1', ns: 'car.race', exp: future }, SECRET), /malformed token ns/);
+});

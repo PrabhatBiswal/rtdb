@@ -94,6 +94,62 @@ export interface StorageAdapter {
    */
   topNodes(): Promise<string[]>;
 
+  /**
+   * §5.19: declare a DATABASE, so that it exists before any data does. On the wire and in this tree
+   * it is still just a top-level segment — `database` is the word the client is given for it, and
+   * the same word Firebase uses for the thing they are replacing.
+   *
+   * This is the whole difference between one being a thing a client OWNS and a thing that merely
+   * happened. Without it a client cannot hand an empty database to a team, a team that deletes
+   * everything deletes the database too, and a usage panel has no row to draw for a database that
+   * holds nothing. `topNodes` unions declared names with derived ones, so this is additive — nothing
+   * that already exists disappears by not being declared.
+   *
+   * Idempotent: re-declaring an existing name is a no-op, never an error.
+   */
+  declareDatabase(name: string, by: string, quotaAcqPerSec?: number | null): Promise<void>;
+
+  /**
+   * §5.24 Gate C: one database's registry row, or `null` if it has none.
+   *
+   * `quotaAcqPerSec: null` means THE SHARD'S DEFAULT, and that is a different statement from any
+   * number: it says nobody has decided for this database, so it follows `QUOTA_ACQ_PER_SEC` when
+   * the shard's number changes. A database that is not in the registry answers `null` for the
+   * whole row — the default tenant is exactly that, being the schema the gateway was configured
+   * with rather than something anyone declared, and it runs on the shard default like any
+   * undecided database.
+   */
+  describeDatabase(name: string): Promise<{ quotaAcqPerSec: number | null } | null>;
+
+  /**
+   * The DECLARED databases, and ONLY those — no derived names.
+   *
+   * `topNodes` is the sidebar's answer and unions the registry with every top-level segment that
+   * has data, which is right for a sidebar and wrong for anything sizing a resource. §5.22 Gate D
+   * sizes the shared pool from N, and a shard holding 30 raw top-level keys under 3 declared
+   * databases would size for 30 — RDS connections spent on chains that do not exist, which is the
+   * cost Gate B took from 154 down to ~15.
+   *
+   * A database this gateway serves that was never declared still exists (the registry is additive);
+   * it just does not get a pool slot of its own, which is what `rtdb_pg_pool_waiting` is for.
+   */
+  listDeclared(): Promise<string[]>;
+
+  /**
+   * §5.24: live bytes per database, for the usage panel's Storage line — keyed by database name,
+   * because the panel bills per database and an adapter is the only thing that can say.
+   *
+   * ONE call for everything this adapter can see, never one per tenant: under Postgres every
+   * tenant is a schema in one database, so the answer is a single catalogue query, and asking it
+   * per tenant would turn a scrape into N round trips against the shard the panel exists to
+   * protect. What an adapter "can see" differs by design and is not papered over — Postgres
+   * answers for the whole shard, the in-memory store for the one database it is.
+   *
+   * The LIVE data only. History is retention (§9), it shrinks on its own, and charging a client
+   * for our durability window would be charging them for our choice.
+   */
+  storageBytes(): Promise<Record<string, number>>;
+
   /** Commit notification — the in-memory stand-in for Postgres LISTEN/NOTIFY (§8). */
   onCommit(cb: () => void): () => void;
 

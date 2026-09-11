@@ -14,6 +14,144 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
   const put = (path: string, value: unknown) =>
     ({ writeId: wid(), path, op: 'put' as const, value: value as never });
 
+  test(`${name}: a DECLARED database survives having no data, and having its data deleted (§5.19)`, async () => {
+    const s = fresh();
+    // Declared first, written never. This is the state an owner hands to a team, and before the
+    // registry it was not a state that could exist at all.
+    await s.declareDatabase('car_race', 'console-rw-owner');
+    assert.deepEqual(await s.topNodes(), ['car_race']);
+
+    // Data under it does not duplicate the name, and a database that was never declared is still
+    // listed - the registry is ADDITIVE, so a store that predates it does not lose its own contents.
+    await s.commitGroup([put('car_race/round/1', { score: 3 }), put('legacy/x', 1)]);
+    assert.deepEqual(await s.topNodes(), ['car_race', 'legacy']);
+
+    // And the whole point: the team deletes everything, and the database is still theirs.
+    await s.commitGroup([put('car_race', null), put('legacy', null)]);
+    assert.deepEqual(await s.topNodes(), ['car_race']);
+  });
+
+  test(`${name}: declaring a database twice is a no-op, not an error (§5.19)`, async () => {
+    const s = fresh();
+    await s.declareDatabase('car_race', 'console-rw-owner');
+    await s.declareDatabase('car_race', 'console-rw-someone-else');
+    assert.deepEqual(await s.topNodes(), ['car_race']);
+  });
+
+  test(`${name}: a name beginning with _ is refused by the registry (§5.22 Gate E)`, async () => {
+    // `_default` and `_other` are synthetic METRICS labels, and both are names `validatePath`
+    // accepts — it forbids only `/ . # $ [ ] ` and control characters. A client who declared
+    // `_default` would find their connections, lag and leadership merged into the bucket a gateway
+    // uses for "no database named", silently, on the panel their bill is read from.
+    //
+    // Refused at the REGISTRY and not only at the admin route in front of it: the route is one door
+    // and the adapter is the room. Both storages, from one rule, because two ideas of a legal name
+    // is what this suite exists to prevent.
+    const s = fresh();
+    for (const bad of ['_default', '_other', '_root', '_anything']) {
+      await assert.rejects(() => s.declareDatabase(bad, 'console-rw-owner'), /reserved/, bad);
+    }
+    // And a name that merely CONTAINS one is fine — the rule is about the first character only.
+    await s.declareDatabase('car_race', 'console-rw-owner');
+    const names = await s.topNodes();
+    assert.ok(names.includes('car_race'), `the legal name was declared: ${names}`);
+    assert.deepEqual(names.filter((n) => n.startsWith('_')), [], 'and no reserved name got in');
+
+    // `includes`, not `deepEqual`, and the asymmetry is real rather than test hygiene: Gate A moved
+    // the registry to a CONTROL schema shared by every adapter on the shard, so under Postgres this
+    // suite's stores share one `databases` table and see each other's declarations — while
+    // `MemoryStorage` keeps a per-instance Set and does not. `fresh()` gives a private tenant
+    // schema, never a private registry, because a shard-wide registry is the whole point of Gate A.
+  });
+
+  test(`${name}: listDeclared is the REGISTRY, never the derived names (§5.22 Gate D shart B)`, async () => {
+    // Two things size themselves off this list and neither may see a derived name: the shared pool
+    // (`sharedPoolSize(N)`, where N is the number of serial `WritePipeline` chains, one per database
+    // this gateway actually serves) and `tenantFor`'s refusal, which is the only thing standing
+    // between a signed token and a `CREATE SCHEMA`. `topNodes` unions in every top-level key that
+    // has DATA — so a shard with 30 raw namespaces under 3 declared databases sized the pool for 30,
+    // and an undeclared namespace that once got written would vouch for itself at hello.
+    const s = fresh();
+    const raw = ['rawa', 'rawb', 'rawc', 'rawd', 'rawe'];
+    await s.commitGroup(raw.map((r) => put(`${r}/x`, 1)));
+    await s.declareDatabase('decl_one', 'console-rw-owner');
+    await s.declareDatabase('decl_two', 'console-rw-owner');
+
+    const declared = await s.listDeclared();
+    const all = await s.topNodes();
+    for (const r of raw) {
+      assert.ok(all.includes(r), `${r} has data, so the sidebar lists it`);
+      assert.ok(!declared.includes(r), `${r} was never declared, so the registry does not`);
+    }
+    for (const d of ['decl_one', 'decl_two']) {
+      assert.ok(declared.includes(d), `${d} was declared`);
+      assert.ok(all.includes(d), 'and declaring is still additive');
+    }
+    // 5 raw + 2 declared, and the gap between the two answers is exactly the 5.
+    assert.equal(all.length - declared.length, 5, `topNodes ${all} vs listDeclared ${declared}`);
+
+    // `includes` above and a computed gap here, rather than a `deepEqual` on either list, for the
+    // reason the `_`-prefix test already gives: Gate A moved the registry to a CONTROL schema shared
+    // by every adapter on the shard, so under Postgres this suite's stores see each other's
+    // declarations. The gap is the claim that survives that — it is about THIS store's data.
+  });
+
+  test(`${name}: storageBytes grows with the data and answers per database (§5.24)`, async () => {
+    // The usage panel's Storage line. What is asserted is the CONTRACT both adapters owe, not a
+    // number: an empty store costs nothing, writing costs more than that, deleting gives it back,
+    // and the answer is keyed by database. The exact bytes are Postgres' catalogue on one side and
+    // an approximation on the other, and pinning either would be pinning the implementation.
+    const s = fresh();
+    const mine = async (): Promise<number> => {
+      const all = await s.storageBytes();
+      // Postgres answers for the WHOLE shard (one query, every tenant schema) and the in-memory
+      // store for the one database it is — so take this store's own entry, however it is keyed.
+      const own = Object.values(all);
+      return own.length === 1 ? (own[0] as number) : own.reduce((a, b) => a + b, 0);
+    };
+
+    const empty = await mine();
+    await s.commitGroup([put('sizing/a', 'x'.repeat(4000)), put('sizing/b', 'y'.repeat(4000))]);
+    const filled = await mine();
+    assert.ok(filled > empty, `writing 8KB must cost something (${empty} -> ${filled})`);
+
+    await s.commitGroup([put('sizing', null)]);
+    const emptied = await mine();
+    assert.ok(emptied <= filled, `deleting must not cost MORE than holding (${filled} -> ${emptied})`);
+  });
+
+  test(`${name}: a database name is a SCHEMA name, and the registry refuses what storage would (§5.26)`, async () => {
+    /**
+     * These two rules used to live apart: `validateDatabaseName` accepted `LightingMacQueen` and
+     * `PostgresStorage`'s constructor refused it. So a client could declare that name, mint a token
+     * for it, and only then have hello fail — 1011 at the factory, three steps from the cause, with
+     * a registry row that CANNOT be deleted because §5.19 gave declaring no inverse.
+     *
+     * Both storages assert it, because the whole point of one rule is that the two agree.
+     */
+    const s = fresh();
+    const long = 'a'.repeat(52); // 52 > 51 = 63 - len('rtdb_commit_'), the NOTIFY channel's headroom
+
+    // Postgres folds an unquoted identifier to lowercase, so `Car` would create `car` and the
+    // registry would disagree with the catalogue about the name forever.
+    await assert.rejects(() => s.declareDatabase('Car_Race', 'console-rw-owner'), /lowercase/, 'capitals');
+    await assert.rejects(() => s.declareDatabase('LightingMacQueen', 'console-rw-owner'), /lowercase/, 'the real one');
+    // A hyphen is not an identifier character: it would have to be quoted at every interpolation.
+    await assert.rejects(() => s.declareDatabase('car-race', 'console-rw-owner'), /lowercase/, 'hyphen');
+    await assert.rejects(() => s.declareDatabase('9lives', 'console-rw-owner'), /digit/, 'leading digit');
+    // Silently truncated at 63 bytes as a channel name, which is how two databases share one.
+    await assert.rejects(() => s.declareDatabase(long, 'console-rw-owner'), /at most 51/, '52 characters');
+
+    // And the shape that is legal stays legal — the rule refuses characters, not names.
+    await s.declareDatabase('car_race', 'console-rw-owner');
+    await s.declareDatabase('lightingmacqueen', 'console-rw-owner');
+    const declared = await s.listDeclared();
+    for (const ok of ['car_race', 'lightingmacqueen']) assert.ok(declared.includes(ok), ok);
+    for (const bad of ['Car_Race', 'LightingMacQueen', 'car-race', '9lives', long]) {
+      assert.ok(!declared.includes(bad), `${bad} never reached the registry`);
+    }
+  });
+
   test(`${name}: an empty store has head 0 and reads null everywhere`, async () => {
     const s = fresh();
     assert.equal(await s.head(), 0);

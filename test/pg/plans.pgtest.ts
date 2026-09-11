@@ -7,7 +7,8 @@ import {
   DELETE_SOLO_SQL,
   likeDescendants,
   RELEVANT_SQL,
-  TOPNODES_SQL,
+  topNodesSql,
+  DEFAULT_CONTROL_SCHEMA,
 } from '../../src/storage/postgres.ts';
 import { createDatabase } from './helper.ts';
 
@@ -19,7 +20,14 @@ import { createDatabase } from './helper.ts';
 const db = await createDatabase('plans');
 after(() => db.drop());
 
+/**
+ * Gate A made the sidebar statement a FUNCTION of the control schema. This binding is the
+ * function's own OUTPUT, which is the property this whole file exists for (§5.17): a hand-written
+ * twin would keep passing after the shipped statement changed underneath it. `db.make` below takes
+ * the default control schema, so this is the statement the adapter actually runs.
+ */
 const SCHEMA = 'plans';
+const TOPNODES = topNodesSql(DEFAULT_CONTROL_SCHEMA, SCHEMA);
 const ROWS = 40_000;
 const DEEP = 'MPK_1010/1474396/game/round/7/players/u_42';
 
@@ -246,7 +254,7 @@ test('topNodes SKIPS along the path index instead of scanning every leaf (§5.6)
   // shard for a result that is a dozen strings, and it gets worse with every leaf ever written.
   // This pins the shape the way the tests above pin RELEVANT_SQL: a plan, on a table big enough for
   // the planner to have a real choice.
-  const nodes = await plan(t, 'topNodes skip scan', TOPNODES_SQL, []);
+  const nodes = await plan(t, 'topNodes skip scan', TOPNODES, []);
   assertNoSeqScan(nodes, 'nodes', 'topNodes');
   const indexed = nodes.filter((n) => n['Node Type'].includes('Index') && n['Relation Name'] === 'nodes');
   assert.ok(indexed.length > 0, 'topNodes must reach `nodes` through an index, not a scan');
@@ -272,7 +280,7 @@ test('topNodes finds ADJACENT namespaces — ns0 beside ns1 and ns10 (§5.6)', a
     ON CONFLICT (path) DO NOTHING`);
   t.after(() => c.query(`DELETE FROM nodes WHERE path IN ('zz/a','zz0','zz1/a','zz10/b/c','zz2')`));
 
-  const { rows } = await c.query<{ name: string }>(TOPNODES_SQL);
+  const { rows } = await c.query<{ name: string }>(TOPNODES);
   const found = rows.map((r) => r.name);
   // Report only the neighbourhood. The fixture also holds 500 MPK_* namespaces, and dumping them
   // into the failure message buries the one fact the reader needs under six kilobytes of noise.
@@ -305,8 +313,8 @@ test('topNodes compares in BYTE order, whatever the server collation is (§5.6)'
   t.diagnostic(`this server's plain >= says ${r.plain_op}; RDS says true, which is the whole bug`);
 
   // And the query must not quietly go back to a collation-dependent comparison.
-  assert.match(TOPNODES_SQL, /~>=~/, 'the boundary comparison must use the byte-ordered operator');
-  assert.match(TOPNODES_SQL, /USING ~<~/, 'the ordering must be byte-ordered too, or LIMIT 1 picks the wrong row');
-  assert.doesNotMatch(TOPNODES_SQL, /path >= /, 'a plain >= on path is the bug that hung production');
-  assert.match(TOPNODES_SQL, /depth < \d+/, 'the depth bound is what turns a future cycle into a truncated list');
+  assert.match(TOPNODES, /~>=~/, 'the boundary comparison must use the byte-ordered operator');
+  assert.match(TOPNODES, /USING ~<~/, 'the ordering must be byte-ordered too, or LIMIT 1 picks the wrong row');
+  assert.doesNotMatch(TOPNODES, /path >= /, 'a plain >= on path is the bug that hung production');
+  assert.match(TOPNODES, /depth < \d+/, 'the depth bound is what turns a future cycle into a truncated list');
 });

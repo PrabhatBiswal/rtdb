@@ -85,9 +85,29 @@ variable "gateway_image_tag" {
     /opt/rtdb/rtdb-deploy.sh <sha> one gateway at a time (ruling Q2), because replacing both
     instances at once would take the fleet down. Bump this default at every gate anyway, so an
     instance replaced months later does not bootstrap a stale image.
+
+    §5.25: this said `f005a42`, which is not a commit in this repository at all — a tag from before
+    the history this repo carries, set 2 September and never moved while production went to
+    `c0337c4`. An instance replaced in that window would have bootstrapped an image nobody had
+    deployed, or none. Gate 0 moved it to what was running; Gate 4 moves it to what IS running,
+    and only after the roll proved healthy rather than merely built (2026-09-07).
+
+    §5.26 Gate D: `0013d18`, and the same rule was obeyed rather than quoted — this moved only after
+    BOTH gateways answered `deploy ok: 0013d18 healthy` and both booted
+    `rtdb multi-tenant: 1 declared databases, pool max 7` with `/healthz` `ok` (gw-1 2026-09-07
+    02:48, gw-2 23:47). The fleet was deliberately mixed-version in between, for a day, and served
+    the whole time. Note what this tag does NOT carry: `RTDB_MULTI_TENANT=1` is in
+    `/opt/rtdb/gateway.env`, so a replacement instance bootstrapping this image gets the name rule
+    and the multi-tenant switch from two different places — see RUNBOOK §4.
+
+    §5.27: `5fa0069`, moved after BOTH gateways answered `deploy ok: 5fa0069 healthy` (gw-1
+    21:48:43, gw-2 21:50:35 IST 2026-09-10), both booted `rtdb multi-tenant: 1 declared databases,
+    pool max 7` with `/healthz` `ok`, and both compose files were read back naming this tag. What
+    it carries over `0013d18` is one route's answer: `POST /databases` now returns WHICH rule an
+    illegal name broke instead of `{"error":"bad name"}`.
   EOT
   type        = string
-  default     = "f005a42"
+  default     = "5fa0069"
 }
 
 variable "ops_image_tag" {
@@ -99,9 +119,12 @@ variable "ops_image_tag" {
     gateway sha was bumped at every gate while the monitoring images kept a single immutable tag, so
     the variable named ops images that had never existed. A replaced ops box would have come up with
     no monitoring at all, and nothing in the plan would have said so. Two tags, two cadences.
+
+    §5.25 Gate 4: `6260a9e`, deployed 2026-09-07 with the four new usage panels — and with the Load
+    query fix, which the dashboard carried too.
   EOT
   type        = string
-  default     = "b57382c"
+  default     = "6260a9e"
 }
 
 # Deploy-review numbers (WORKLOAD §2). PROPOSED here; the formal ruling is Gate C's, which is why
@@ -551,8 +574,33 @@ resource "aws_iam_instance_profile" "ops" {
 # and the monitoring stack are released independently, so they version independently.
 variable "console_image_tag" {
   type        = string
-  description = "rtdb-console artifact tag the ops box extracts the console from."
-  default     = "f005a42"
+  description = <<-EOT
+    rtdb-console artifact tag the ops box extracts the console from.
+
+    §5.25: also `f005a42` — the same tag that is not in this history — while the console on the box
+    had been hand-deployed since (§7c's file-copy path), so a replaced ops box would have served a
+    console nobody had run. Gate 3 built and deployed `rtdb-console:6260a9e`, and this named it
+    (2026-09-07).
+
+    §5.26 Gate D moves it to `0013d18`, and the tag was checked against the BOX rather than against
+    the gate's story: `sha256sum /opt/rtdb-console/rtdb-console.html` on the ops box is
+    `e8aa30da…47939b`, which is `git show 0013d18:console/rtdb-console.html` byte for byte (110,696
+    B), and `rtdb-console:0013d18` is in ECR (pushed 02:15:50 IST). The §5.26 Gate C.5 report's own
+    table said the console was still `6260a9e`; it was wrong, and only hashing the deployed file said
+    so. NOT the gateway's sha by coincidence here — the console and the gateway happen to share
+    `0013d18` this once, while `ops_image_tag` stays `6260a9e`. Three variables, three cadences: that
+    they agree today is not a reason to collapse them.
+
+    §5.29: `13bd47b`, and the coincidence above has ended — the gateways run `5fa0069` and the
+    console runs `13bd47b`, which is the normal state and the reason these are two variables.
+    Checked against the BOX again rather than against the gate's story: `sha256sum` on the ops box
+    reads `2986e35b…c93d8e` for the html and `970c73b6…e283d9b` for `auth-server.mjs`, both equal to
+    the local files, and the page served through CloudFront hashes to the same bytes once
+    `CONSOLE_WSS` is substituted. `rtdb-console:13bd47b` is in ECR (`sha256:28047afe…`, pushed
+    2026-09-10 23:28 IST); the files were installed by §7c's copy path, and this variable is what a
+    REPLACED ops box would extract.
+  EOT
+  default     = "13bd47b"
 }
 
 locals {
