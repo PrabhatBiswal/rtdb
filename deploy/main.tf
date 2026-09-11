@@ -680,12 +680,12 @@ resource "aws_instance" "gateway" {
 }
 
 resource "aws_instance" "ops" {
-  ami                         = data.aws_ami.al2023_arm64.id
-  instance_type               = "t4g.small"
-  subnet_id                   = local.subnet_ids[0]
-  vpc_security_group_ids      = [aws_security_group.ops.id]
-  iam_instance_profile        = aws_iam_instance_profile.ops.name
-  user_data                   = local.ops_user_data
+  ami                    = data.aws_ami.al2023_arm64.id
+  instance_type          = "t4g.small"
+  subnet_id              = local.subnet_ids[0]
+  vpc_security_group_ids = [aws_security_group.ops.id]
+  iam_instance_profile   = aws_iam_instance_profile.ops.name
+  user_data              = local.ops_user_data
   # §5.13: a user_data change must REPLACE this box, not update the attribute in place.
   #
   # The provider default is false, and false is silently useless here: user_data executes at FIRST
