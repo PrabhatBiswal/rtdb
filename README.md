@@ -270,7 +270,10 @@ terraform apply \
   -var vpc_id=... \
   -var subdomain=rtdb.example.com \
   -var db_password=... \
-  -var jwt_secret=...
+  -var jwt_secret=... \
+  -var gateway_image_tag=... \
+  -var ops_image_tag=... \
+  -var console_image_tag=...
 ```
 
 `vpc_id`, `subdomain` and `console_subdomain` have no defaults on purpose — Terraform prompts for

@@ -107,7 +107,7 @@ variable "gateway_image_tag" {
     illegal name broke instead of `{"error":"bad name"}`.
   EOT
   type        = string
-  default     = "5fa0069"
+  # No default: set it in deploy/images.auto.tfvars (gitignored) to a tag that exists in YOUR registry.
 }
 
 variable "ops_image_tag" {
@@ -124,7 +124,7 @@ variable "ops_image_tag" {
     query fix, which the dashboard carried too.
   EOT
   type        = string
-  default     = "6260a9e"
+  # No default: set it in deploy/images.auto.tfvars (gitignored) to a tag that exists in YOUR registry.
 }
 
 # Deploy-review numbers (WORKLOAD §2). PROPOSED here; the formal ruling is Gate C's, which is why
@@ -600,7 +600,7 @@ variable "console_image_tag" {
     2026-09-10 23:28 IST); the files were installed by §7c's copy path, and this variable is what a
     REPLACED ops box would extract.
   EOT
-  default     = "13bd47b"
+  # No default: set it in deploy/images.auto.tfvars (gitignored) to a tag that exists in YOUR registry.
 }
 
 locals {
