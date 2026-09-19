@@ -23,8 +23,19 @@ import { DEFAULT_LIMITS } from '../protocol/limits.ts';
 // bucket collapses onto it, so the histogram reads "saturated" identically to "10 seconds", and we
 // were blind server-side to the most important number of the test. The tail above is deliberately
 // coarse: nobody tunes a 90-second ack, they only need to SEE it.
+/**
+ * The top bucket is a CEILING on what these histograms can ever report, and it has now been hit
+ * twice. On 2026-08-29 the top was 30 s and Gate D's ack stall read `p50 = p99 = 30 s`; the top was
+ * raised to 300 s, and §5.30's C1/C2' read `p50 = p99 = 300 s` for both `put` and `cas` while the
+ * CLIENTS measured 385-750 s. A quantile pinned to the last bucket is not a measurement, it is the
+ * histogram saying "at least this" — and both times it hid the size of the very thing under test.
+ *
+ * 900 and 1800 are added rather than the scale rewritten: existing recording rules and dashboards
+ * keep every boundary they already query, and 30 minutes is past any latency this system could
+ * report and still be called working.
+ */
 const LATENCY_BUCKETS = [
-  0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10, 30, 60, 120, 300,
+  0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10, 30, 60, 120, 300, 900, 1800,
 ];
 
 export const connections = new Gauge({

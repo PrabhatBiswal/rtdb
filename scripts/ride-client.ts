@@ -4,21 +4,28 @@
  * one. Writes to a scratch path; every write is counted and every outcome is named.
  *
  *   SK_FILE=/path/to/shadow-key node --import tsx scripts/ride-client.ts <seconds>
+ *
+ * `RTDB_TOKEN` skips the mint — a local rig has no shadow-token server — and `RTDB_RIDE_PATH` moves
+ * the scratch subtree, which §5.20 Phase 1 requires the moment the rider carries an `ns` claim: a
+ * `b` token may not touch `drill/ride`, only `b/drill/ride` (`pipeline/rules.ts:142`).
  */
 import { readFileSync } from 'node:fs';
 import { RtdbClient } from '../harness/client.ts';
 
 const secs = Number(process.argv[2] ?? 90);
-const key = readFileSync(process.env['SK_FILE'] as string, 'utf8').trim();
 
-const tokenUrl = process.env['RTDB_SHADOW_TOKEN_URL'] ?? 'http://127.0.0.1:8788/shadow-token';
-
-const r = await fetch(tokenUrl, {
-  method: 'POST',
-  headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-  body: JSON.stringify({ device: 'ride-client' }),
-});
-const { token } = (await r.json()) as { token: string };
+const mint = async (): Promise<string> => {
+  const key = readFileSync(process.env['SK_FILE'] as string, 'utf8').trim();
+  const tokenUrl = process.env['RTDB_SHADOW_TOKEN_URL'] ?? 'http://127.0.0.1:8788/shadow-token';
+  const r = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ device: 'ride-client' }),
+  });
+  return ((await r.json()) as { token: string }).token;
+};
+const token = process.env['RTDB_TOKEN'] ?? (await mint());
+const RIDE = process.env['RTDB_RIDE_PATH'] ?? 'drill/ride';
 
 const c = new RtdbClient({ url: process.env['RTDB_URL'] ?? 'ws://127.0.0.1:8080', token, sdk: 'ride/1' });
 let acks = 0, errs = 0, issued = 0, closes = 0, opens = 0;
@@ -67,13 +74,13 @@ c.on('state', (s: string) => {
 });
 c.connect();
 await c.ready();
-c.listen('drill/ride');
+c.listen(RIDE);
 
 const t0 = Date.now();
 const timer = setInterval(() => {
   issued++;
   const at = Date.now();
-  c.put(`drill/ride/n`, issued).then(
+  c.put(`${RIDE}/n`, issued).then(
     () => {
       acks++;
       const lag = Date.now() - at;
@@ -113,5 +120,5 @@ console.log(JSON.stringify({
     p50: [...holes].sort((a, b) => a - b)[Math.floor(holes.length / 2)] ?? 0,
   },
 }));
-await c.put('drill/ride', null); // scratch cleanup
+await c.put(RIDE, null); // scratch cleanup
 c.close();

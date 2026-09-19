@@ -14,6 +14,10 @@
  *   --bus 1          spawn Redis even for --spawn 1 (2 gateways always get one)
  *   --pg URL         Postgres for the `nodes` convergence check in --gateways mode
  *   --schema NAME    the shard's schema there (default public)
+ *   --ns NAME        §5.20 database claim: token gets `ns`, and ROOT moves under it
+ *   --leaves L       write to `<root>/own/<id>/<idx>/k<0..L>` instead of one `v` (default 1)
+ *   --cleanup 0      keep the tree after the run; default is to `put null ROOT`
+ *   --settle S       seconds to wait for the last deltas before counting what is behind (20)
  *   --hot F          fraction of CONNECTIONS also watching the shared hot path (default 0.1)
  *   --hotwrite F     fraction of WRITES aimed at that hot path            (default 0.05)
  *   --cas F          fraction of writes that are CAS                (default 0.05)
@@ -52,11 +56,23 @@ const CFG = {
   hotwrite: num('hotwrite', 0.05),
   cas: num('cas', 0.05),
   sample: num('sample', 20),
+  leaves: num('leaves', 1),
 };
 
-const ROOT = 'sim';
+/**
+ * §5.20 Phase 1 confines an `ns` token to paths under that one segment (`rules.ts:142`), and the
+ * claim ALSO picks the tenant at hello (`server.ts:588`). So naming a database moves the whole run
+ * into it — schema and path both — and there is no second flag for the prefix: one of them would be
+ * wrong eventually. Without `--ns` this is the old run, on the default tenant, at `sim`.
+ */
+const NS = flag('ns', '');
+const ROOT = NS ? `${NS}/sim` : 'sim';
 const HOT = `${ROOT}/hot`;
-const TOKEN = signDevToken({ sub: 'u_loadsim', exp: Math.floor(Date.now() / 1000) + 3600 });
+const TOKEN = signDevToken({
+  sub: 'u_loadsim',
+  ...(NS ? { ns: NS } : {}),
+  exp: Math.floor(Date.now() / 1000) + 3600,
+});
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 interface Report {
@@ -117,7 +133,12 @@ async function worker(): Promise<void> {
   const perTick = Math.max(1, Math.round(rate / 100));
   const tickMs = perTick === 1 ? Math.max(1, Math.round(1000 / rate)) : 10;
   const deadline = Date.now() + CFG.seconds * 1000;
-  const lastRev = new Map<number, number>();
+  /**
+   * Keyed by PATH, not by connection: with `--leaves > 1` one connection writes many leaves, and a
+   * rev remembered per connection would be a rev from a different node — every CAS would fail on
+   * the first mismatch and report a fanout-shaped run as a CAS-shaped one.
+   */
+  const lastRev = new Map<string, number>();
   /** The last value each private path was written with — the ground truth for convergence. */
   const wrote = new Map<string, number>();
   let n = 0;
@@ -129,11 +150,15 @@ async function worker(): Promise<void> {
     for (let k = 0; k < perTick; k++) {
       const idx = n % clients.length;
       const c = clients[idx] as RtdbClient;
-      const mine = `${ROOT}/own/${id}/${idx}/v`;
+      // §5.30: one leaf per connection keeps the subtree a fixed size forever. `--leaves L` spreads
+      // the writes over L of them, so the tree GROWS while the run holds its rate — which is what
+      // the storage line is supposed to climb on.
+      const leaf = CFG.leaves > 1 ? `k${Math.floor(Math.random() * CFG.leaves)}` : 'v';
+      const mine = `${ROOT}/own/${id}/${idx}/${leaf}`;
       const path = Math.random() < CFG.hotwrite ? `${HOT}/w${id}` : mine;
       const value = { t: Date.now(), n: ++n };
       const started = Date.now();
-      const expected = lastRev.get(idx);
+      const expected = lastRev.get(mine);
       const useCas = expected !== undefined && Math.random() < CFG.cas;
       inflight.push(
         (useCas ? c.cas(mine, expected, value) : c.put(path, value))
@@ -141,11 +166,11 @@ async function worker(): Promise<void> {
             if (res.type === 'ack') {
               r.acks++;
               if (useCas) r.casOk++;
-              lastRev.set(idx, res.rev);
+              lastRev.set(mine, res.rev);
               if (useCas || path === mine) wrote.set(mine, value.n);
             } else {
               r.casFail++;
-              lastRev.set(idx, res.rev);
+              lastRev.set(mine, res.rev);
             }
             r.ackMs.push(Date.now() - started);
           })
@@ -159,19 +184,31 @@ async function worker(): Promise<void> {
   }
   await Promise.all(inflight);
 
-  // Every connection watches its own subtree, so its mirror MUST carry the last value it wrote.
-  // Polled rather than slept on: under saturation the tail of the fan-out can be seconds behind, and
-  // a fixed sleep would report the simulator's own backlog as a divergence.
+  /**
+   * Every connection watches its own subtree, so its mirror MUST eventually carry the last value it
+   * wrote. Polled rather than slept on, and the deadline is what this number MEANS:
+   *
+   * **A non-zero count here is "deltas that had not arrived yet when the clock ran out", NOT a
+   * divergence.** §5.30 C1 read 7,932 and 4,935 on two databases and 0 on the other two, with
+   * `fanout_seconds` p50 at 4-7 MINUTES — every one of those paths was acked, committed, and
+   * waiting in its own connection's sink queue. Against a 20 s deadline that is arithmetic, not a
+   * fault. Divergence would have to survive an unbounded wait, and this loop cannot offer one: the
+   * run has to end. So `--settle` is the knob, the printed line says how long it waited, and the
+   * authoritative check for a real mismatch is the `nodes` convergence query below — which needs
+   * `--pg` and is therefore SKIPPED on the production runs, where this number is all there is.
+   */
   const behind = (): number => {
     let n = 0;
     for (const [path, value] of wrote) {
-      const idx = Number(path.split('/')[3]);
+      // Second-to-last segment, not a fixed index: ROOT grows a database segment under `--ns` and
+      // the leaf name varies under `--leaves`. The one thing that never moves is `.../<idx>/<leaf>`.
+      const idx = Number(path.split('/').at(-2));
       const mirrored = (clients[idx] as RtdbClient).mirror.serverValue(path) as { n?: number } | null;
       if (mirrored?.n !== value) n++;
     }
     return n;
   };
-  const settleBy = Date.now() + 20_000;
+  const settleBy = Date.now() + num('settle', 20) * 1000;
   while (behind() > 0 && Date.now() < settleBy) await sleep(250);
   r.mismatches = behind();
   for (const c of clients) r.pending += c.pendingWriteIds.length;
@@ -219,6 +256,7 @@ async function parent(): Promise<void> {
     `loadsim: ${CFG.conns} conns / ${CFG.procs} procs / ${CFG.rate} w/s / ${CFG.seconds}s over ${urls.length} gateway(s)`,
   );
   console.log(`  gateways: ${urls.join(' ')}`);
+  console.log(`  database: ${NS || '(default tenant, no --ns)'}    ROOT: ${ROOT}    leaves: ${CFG.leaves}`);
   console.log(`  open-file soft limit: ${limit?.open_files?.soft ?? 'unknown'} (each connection is one fd per side)`);
   console.log(
     `  shape: ${(CFG.hot * 100).toFixed(0)}% of connections watch the hot path, ${(CFG.hotwrite * 100).toFixed(0)}% of writes hit it` +
@@ -301,7 +339,27 @@ async function parent(): Promise<void> {
   console.log(`  ack p50 / p99   ${pct(ackMs, 50)}ms / ${pct(ackMs, 99)}ms`);
   console.log(`  fanout p50/p99  ${pct(lagMs, 50)}ms / ${pct(lagMs, 99)}ms   (${lagMs.length} samples, 1 in ${CFG.sample})`);
   console.log(`  convergence     ${checked - bad}/${checked} sampled paths match \`nodes\``);
-  console.log(`  mirror mismatch ${sum('mismatches')}`);
+  console.log(
+    `  mirror behind    ${sum('mismatches')} paths still un-mirrored after ${num('settle', 20)}s` +
+      ' (deltas not yet arrived, NOT a divergence — see the note in worker())',
+  );
+
+  /**
+   * §5.30 Gate 0(a): the run puts its own tree back. `/topnodes` before must equal `/topnodes`
+   * after — under `--ns` the database is DECLARED and stays either way, but on the default tenant
+   * `sim` is a derived top-level name that would otherwise linger in the sidebar forever.
+   *
+   * `--cleanup 0` is for a LADDER: §5.30's steps are meant to grow one subtree across runs, so
+   * every step but the last keeps what it wrote.
+   */
+  if (flag('cleanup', '1') !== '0') {
+    const c = new RtdbClient({ url: urls[0] as string, token: TOKEN, pingIntervalMs: 60_000 });
+    c.connect();
+    await c.ready();
+    await c.put(ROOT, null);
+    c.close();
+    console.log(`  cleanup         put null ${ROOT}`);
+  }
 
   await stop();
   process.exit(sum('errs') === 0 && bad === 0 && sum('pending') === 0 ? 0 : 1);
