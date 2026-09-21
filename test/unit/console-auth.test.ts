@@ -1205,7 +1205,7 @@ test('opened as a FILE the page still carries the local default', () => {
 
 test('a name that would not be a legal SCHEMA is refused at declare, not at hello (§5.26)', async () => {
   /**
-   * The whole point of moving the rule: `LightingMacQueen` used to pass `/databases` and fail three
+   * The whole point of moving the rule: `TenantAlpha` used to pass `/databases` and fail three
    * steps later at the tenant factory — 1011 on a hello, with a registry row nobody can delete,
    * because §5.19 gave declaring no inverse on purpose.
    */
@@ -1222,7 +1222,7 @@ test('a name that would not be a legal SCHEMA is refused at declare, not at hell
     // §5.27: and the reason survives the auth-server's pass-through — the console alerts `error`
     // verbatim, so "which rule" has to arrive here, not just 400.
     const bad: [string, RegExp][] = [
-      ['LightingMacQueen', /lowercase letters/],
+      ['TenantAlpha', /lowercase letters/],
       ['Car_Race', /lowercase letters/],
       ['car-race', /lowercase letters/],
       ['9lives', /lowercase letters/],
@@ -1243,7 +1243,7 @@ test('a name that would not be a legal SCHEMA is refused at declare, not at hell
       assert.match(String(r.body['error']), reason, name);
     }
     // And the legal shape still declares — the rule refuses characters, not names.
-    assert.equal((await declare('lightingmacqueen')).status, 201);
+    assert.equal((await declare('tenantalpha')).status, 201);
     assert.equal((await declare('car_race')).status, 201);
   } finally {
     stop(rig);

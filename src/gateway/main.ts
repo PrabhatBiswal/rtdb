@@ -112,11 +112,37 @@ if (multiTenant) {
   tenantStorage = shared.tenantStorage;
   bindPoolWaiting(() => shared.pool.waitingCount);
   closeStorage = shared.close;
+  /**
+   * §5.35: `RTDB_PG_POOL` is read by `storageFromEnv()` and by nothing else, so in THIS mode it is
+   * ignored — the pool is sized from the registry (`sharedPoolSize`), which is the number
+   * `rtdb_pg_pool_waiting` exists to make readable. Production sets both in one file
+   * (`deploy/user-data/rtdb-deploy.sh` writes `RTDB_PG_POOL` and `RTDB_MULTI_TENANT=1` into
+   * `/opt/rtdb/gateway.env`), and that script is already on the boxes, so refusing the pair would
+   * brick the next roll and then every reboot after it. Honouring it would move a live production
+   * number instead. The third answer is the boot line: a knob that does nothing is dangerous while
+   * it is SILENT, and the operator who set 20 can now read that the gateway opened something else.
+   */
+  const ignoredPool = process.env['RTDB_PG_POOL'];
   process.stderr.write(
-    `rtdb multi-tenant: ${shared.declared.length} declared databases, pool max ${shared.max}\n`,
+    `rtdb multi-tenant: ${shared.declared.length} declared databases, pool max ${shared.max}` +
+      (ignoredPool ? ` (RTDB_PG_POOL=${ignoredPool} ignored: size comes from the registry)` : '') +
+      '\n',
   );
 } else {
   storage = storageFromEnv();
+  /**
+   * §5.35: the single-tenant pool has waiters too, and until now nothing reported them. The bind
+   * lived inside the `multiTenant` branch only, so a Postgres gateway that is NOT multi-tenant
+   * scraped `rtdb_pg_pool_waiting` as a flat 0 however deep its queue ran — the one instrument
+   * §5.21 asked for, dead on the path most deployments and every `test:pg` run take.
+   *
+   * Narrowed into a const because `storage` is a `let`: TypeScript's narrowing does not survive
+   * into the closure, and the closure is the whole point — the gauge reads it at scrape time.
+   */
+  if (storage instanceof PostgresStorage) {
+    const pg = storage;
+    bindPoolWaiting(() => pg.poolWaiting);
+  }
 }
 
 /**

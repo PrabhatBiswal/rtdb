@@ -47,6 +47,18 @@ class Proxy private constructor(
         for (pair in pairs) closePair(pair)
     }
 
+    /**
+     * §5.36: kill [n] live connections chosen at random, leaving the rest alone — the soak needs a
+     * few clients reconnecting continuously while the others keep serving, which [cut] (all of
+     * them, at once) cannot express. One proxy with this beats 50 proxies: 50 ServerSockets and
+     * 100+ pump threads on an 8 GB laptop is the harness becoming the load.
+     */
+    fun cutSome(n: Int): Int {
+        val victims = pairs.shuffled().take(n)
+        for (pair in victims) closePair(pair)
+        return victims.size
+    }
+
     /** Cut, and refuse reconnects: the server is unreachable, not merely slow. */
     fun blackhole() {
         blocked = true

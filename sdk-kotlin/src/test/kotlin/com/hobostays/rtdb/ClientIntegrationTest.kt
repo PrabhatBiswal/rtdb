@@ -1,14 +1,22 @@
 package com.hobostays.rtdb
 
+import com.hobostays.rtdb.api.ChildEvent
 import com.hobostays.rtdb.api.INFO_CONNECTED
 import com.hobostays.rtdb.api.RtdbClient
 import com.hobostays.rtdb.api.WriteResult
+import com.hobostays.rtdb.api.childEvents
 import com.hobostays.rtdb.core.ConnectionOptions
 import com.hobostays.rtdb.core.Limits
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -228,6 +236,147 @@ class ClientIntegrationTest {
             } finally {
                 gateway.stop()
             }
+        }
+    }
+
+    /** The same story as the callback test above, told through the Flow (§5.32). */
+    @Test
+    fun `childEvents() delivers add, change and remove in order (§5,32)`() {
+        val gateway = GatewayProcess.start()
+        try {
+            client(gateway.url).use { writer ->
+                client(gateway.url).use { reader ->
+                    val seen = CopyOnWriteArrayList<String>()
+                    val collector = CoroutineScope(Dispatchers.Default).launch {
+                        reader.ref("room").childEvents().collect { seen += it.label() }
+                    }
+                    // Collecting is what subscribes; the sub appearing is the flow's listener landing.
+                    waitUntil("the flow to subscribe to \"room\"") { reader.subscriptionPaths.contains("room") }
+
+                    writer.ref("room/a").setValue(JsonPrimitive(1))
+                    waitUntil("child added") { seen.size == 1 }
+                    writer.ref("room/a").setValue(JsonPrimitive(2))
+                    waitUntil("child changed") { seen.size == 2 }
+                    writer.ref("room/a").removeValue()
+                    waitUntil("child removed") { seen.size == 3 }
+
+                    assertEquals(listOf("added:a=1", "changed:a=2", "removed:a=2"), seen.toList())
+                    assertConverged(gateway.url, writer, reader)
+
+                    // Cancelling collection unlistens: the flow held the only listener on "room", so
+                    // the subscription itself goes away (RtdbClient.removeListener).
+                    collector.cancel()
+                    waitUntil("the subscription to be dropped") { !reader.subscriptionPaths.contains("room") }
+                }
+            }
+        } finally {
+            gateway.stop()
+        }
+    }
+
+    /**
+     * THE TOOTH (§5.32): a collector that arrives after 100 children already exist is replayed all
+     * 100 in one tight loop on the client dispatcher (RtdbClient.kt:180). With callbackFlow's
+     * default 64-slot buffer `trySend` refuses past 64 and drops silently; this asserts the count.
+     */
+    @Test
+    fun `childEvents() loses nothing replaying 100 existing children to a late collector (§5,32)`() {
+        val gateway = GatewayProcess.start()
+        try {
+            client(gateway.url).use { writer ->
+                client(gateway.url).use { reader ->
+                    val children = (1..100).associate { "c$it" to JsonPrimitive(it) as JsonElement }
+                    writer.ref("room").setValue(JsonObject(children))
+
+                    // The reader holds the full subtree BEFORE it collects: this is the late-listener
+                    // replay path, not the fresh-snapshot one.
+                    val values = ValueRecorder()
+                    reader.ref("room").addValueEventListener(values)
+                    waitUntil("the reader to mirror all 100 children") {
+                        ((values.last as? JsonObject)?.size ?: 0) == 100
+                    }
+
+                    val seen = CopyOnWriteArrayList<ChildEvent>()
+                    val collector = CoroutineScope(Dispatchers.Default).launch {
+                        reader.ref("room").childEvents().collect {
+                            seen += it
+                            // A collector that DOES something per child — an Android list update is
+                            // milliseconds, the replay loop is microseconds. Without it the consumer
+                            // keeps up with all 100 and the buffer is never under pressure at all.
+                            delay(2)
+                        }
+                    }
+                    // Not waitUntil's own check: a timeout here must report the COUNT, which is the
+                    // whole finding, and waitUntil's label is built before the wait starts.
+                    runCatching { waitUntil("100 replayed child_added events", 10_000) { seen.size >= 100 } }
+                    collector.cancel()
+
+                    assertEquals(100, seen.size, "replayed events")
+                    assertTrue(seen.all { it is ChildEvent.Added }, "every replayed event is an Added")
+                    assertEquals(
+                        (1..100).map { "c$it" }.toSet(),
+                        seen.mapNotNull { it.snapshot.key }.toSet(),
+                        "every child key arrived exactly once",
+                    )
+                }
+            }
+        } finally {
+            gateway.stop()
+        }
+    }
+
+    /**
+     * The child baseline is per-SUBSCRIPTION, not per-listener, and a value listener can keep a sub
+     * alive after a collector is gone (RtdbClient.kt:182). A second collector must therefore be
+     * replayed the tree as it is NOW — re-baselining on every add is what makes that true, and
+     * dropping it replays the children the first collector saw.
+     */
+    @Test
+    fun `a second childEvents() collector replays the tree as it is now (§5,32)`() {
+        val gateway = GatewayProcess.start()
+        try {
+            client(gateway.url).use { writer ->
+                client(gateway.url).use { reader ->
+                    // Outlives both collectors, so the subscription is never dropped between them.
+                    val values = ValueRecorder()
+                    reader.ref("room").addValueEventListener(values)
+
+                    writer.ref("room/a").setValue(JsonPrimitive(1))
+                    values.awaitValue(json("""{"a":1}"""))
+
+                    val first = CopyOnWriteArrayList<String>()
+                    val c1 = CoroutineScope(Dispatchers.Default).launch {
+                        reader.ref("room").childEvents().collect { first += it.label() }
+                    }
+                    waitUntil("the first collector to be replayed a") { first.size == 1 }
+                    c1.cancel()
+                    // removeListener is posted to the client dispatcher, so the unlisten is not
+                    // synchronous with cancel(). No new probe for it: if it never landed, `first`
+                    // grows past one event and the assertion at the end of this test says so.
+                    Thread.sleep(200)
+
+                    // The tree changes while NO child listener exists — the window where a frozen
+                    // baseline goes stale.
+                    writer.ref("room/a").removeValue()
+                    writer.ref("room/b").setValue(JsonPrimitive(2))
+                    values.awaitValue(json("""{"b":2}"""))
+
+                    val second = CopyOnWriteArrayList<String>()
+                    val c2 = CoroutineScope(Dispatchers.Default).launch {
+                        reader.ref("room").childEvents().collect { second += it.label() }
+                    }
+                    waitUntil("the second collector to be replayed b") { second.size >= 1 }
+                    // A stale baseline shows up as an EXTRA event after the first, so give it room.
+                    Thread.sleep(300)
+                    c2.cancel()
+
+                    assertEquals(listOf("added:b=2"), second.toList(), "second collector's replay")
+                    assertEquals(listOf("added:a=1"), first.toList(), "first collector's replay")
+                    assertConverged(gateway.url, writer, reader)
+                }
+            }
+        } finally {
+            gateway.stop()
         }
     }
 }

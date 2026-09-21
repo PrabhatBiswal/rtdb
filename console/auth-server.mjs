@@ -326,7 +326,7 @@ async function declareDatabase(name, sub, quotaAcqPerSec) {
      *
      * The name rule itself is NOT copied here. It lives in `src/protocol/path.ts` and the gateway's
      * admin route enforces it; this file has no build step and no `src/` import, so a second regex
-     * here would be the exact "two ideas of a legal name" that made `LightingMacQueen` declarable
+     * here would be the exact "two ideas of a legal name" that made `TenantAlpha` declarable
      * and unusable in the first place. One rule, one home, and this hop reports its answer.
      */
     const body = await r.json().catch(() => ({}));

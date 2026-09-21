@@ -638,7 +638,7 @@ variable "gateway_count" {
   default = 2
 }
 
-# Which subnet a THIRD-or-later gateway lands in. 0 = ap-south-1b, 1 = 1c, 2 = 1a.
+# Which subnet a THIRD-or-later gateway lands in, as an index into `local.subnet_ids`.
 variable "extra_gateway_subnet" {
   type    = number
   default = 0
@@ -652,8 +652,10 @@ resource "aws_instance" "gateway" {
   # Gateways 1 and 2 keep their subnets exactly (index 0 and 1), so this expression never forces a
   # replacement of a serving instance. Any gateway BEYOND the designed pair is a temporary
   # measurement box, and `extra_gateway_subnet` exists because RunInstances stalled twice — never
-  # returning, never erroring — for an instance in ap-south-1a while identical shapes launched in
-  # 1b and 1c minutes apart. §8 puts no AZ constraint on a box that exists for one afternoon.
+  # returning, never erroring — for an instance in ONE of the zones while identical shapes launched
+  # in the others minutes apart. §8 puts no AZ constraint on a box that exists for one afternoon.
+  # (Which zone is a fact about this account, not about the design: it is in the subnet list
+  # Terraform already holds, and naming it here only published it.)
   subnet_id              = count.index < 2 ? local.subnet_ids[count.index] : local.subnet_ids[var.extra_gateway_subnet]
   vpc_security_group_ids = [aws_security_group.gateway.id]
   iam_instance_profile   = aws_iam_instance_profile.gateway.name

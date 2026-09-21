@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import type pg from 'pg';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import type { ServerFrame } from '../../src/protocol/frames.ts';
@@ -364,7 +365,7 @@ test('POST /databases says WHICH rule the name broke, not just that it is bad (�
    * not fail the test but swapping two reasons for each other does.
    */
   const cases: [unknown, RegExp][] = [
-    ['LightingMacQueen', /lowercase letters/],
+    ['TenantAlpha', /lowercase letters/],
     ['a'.repeat(52), /at most 51/],
     ['a/b', /one path segment/],
     ['', /required/],
@@ -568,3 +569,70 @@ test('the db label is bounded, whatever names arrive', async () => {
 // budget is its own". My checkpoint called it unobservable and the mentor cross-questioned that
 // correctly — the db dimension only answers `_other` once ITS budget is spent, and this test is
 // the only thing that spends it. Order was the instrument, not a fresh module.
+
+/**
+ * §5.35 (1): `rtdb_pg_pool_waiting` on the SINGLE-TENANT path, where it read a flat 0 until now.
+ *
+ * The gauge and its `bindPoolWaiting` arrived with Gate D's shared tenancy and `main.ts` bound them
+ * inside `if (multiTenant)` only. A Postgres gateway that is not multi-tenant builds its pool
+ * INSIDE the adapter, so nothing outside could see `waitingCount` and the instrument §5.21 asked
+ * for reported zero waiters however deep the queue ran.
+ *
+ * The fake pool is the whole test: a real one would have to be made to queue, which is a timing
+ * game, and what is under test is not pg's counter but whether this process reads it at all.
+ */
+test('§5.35: the gauge reads the single-tenant adapter\'s OWN pool, not just a shared one', async () => {
+  const { PostgresStorage } = await import('../../src/storage/postgres.ts');
+  const { bindPoolWaiting, pgPoolWaiting } = await import('../../src/gateway/metrics.ts');
+  // `on` because the constructor registers the pool's one `remove` handler; nothing else is
+  // touched before a query, and this test never runs one.
+  const pool = { waitingCount: 7, on: () => {} } as unknown as pg.Pool;
+  const storage = new PostgresStorage({ url: 'postgres://127.0.0.1:1/unreachable', schema: 'lonely', pool });
+  const unbind = bindPoolWaiting(() => storage.poolWaiting);
+  try {
+    const [gauge] = (await pgPoolWaiting.get()).values;
+    assert.equal(gauge?.value, 7, 'the scrape must report the adapter\'s own waiters');
+  } finally {
+    unbind();
+  }
+});
+
+test('§5.35: main.ts binds the pool gauge on the single-tenant path too', async () => {
+  // The static half, for the same reason `unhandled-rejection.test.ts` keeps one: the bind is a
+  // statement in a boot script with no return value, the gauge defaults to 0 when nothing is bound,
+  // and 0 is also a perfectly ordinary reading. Delete the call and every behavioural test above
+  // stays green — they exercise `bindPoolWaiting`, never main's use of it.
+  const main = await readFile(new URL('../../src/gateway/main.ts', import.meta.url), 'utf8');
+  const single = main.slice(main.indexOf('storage = storageFromEnv();'));
+  assert.ok(single.length > 0, 'the single-tenant branch moved; this test has to move with it');
+  assert.match(
+    single,
+    /bindPoolWaiting\(/,
+    'the single-tenant branch must bind rtdb_pg_pool_waiting, or it reports 0 forever',
+  );
+});
+
+/**
+ * §5.35 (3): the 300 -> 900 hole. The ceiling has been 1800 since 1731986, so nothing is pinned at
+ * `+Inf` any more — but §5.30 measured client-side acks at 385-750 s, and every one of those fell
+ * into `le=900`: a quantile reporting up to 1.8x the truth. 600 and 1200 are RESOLUTION, added
+ * without moving a boundary any dashboard already queries.
+ */
+test('§5.35: a 500 s ack lands in the 600 bucket, not 900', async () => {
+  const { ackSeconds } = await import('../../src/gateway/metrics.ts');
+  ackSeconds.reset();
+  ackSeconds.observe({ op: 'put' }, 500);
+  ackSeconds.observe({ op: 'put' }, 900);
+  const buckets = (await ackSeconds.get()).values.filter((v) => v.metricName?.endsWith('_bucket') === true);
+  const le = (bound: number): number | undefined =>
+    buckets.find((v) => (v.labels as Record<string, string | number>)['le'] === bound)?.value;
+
+  assert.equal(le(300), 0, 'neither observation is under 300 s');
+  assert.equal(le(600), 1, 'the 500 s ack is cumulative in 600 — this bucket is the fix');
+  assert.equal(le(900), 2, 'and 900 s lands in 900: an observation ON a boundary is inside it');
+  assert.equal(le(1200), 2);
+  assert.equal(le(1800), 2, 'the 1800 ceiling from 1731986 stays where dashboards expect it');
+  for (const bound of [0.001, 10, 30, 60, 120, 300, 900, 1800]) {
+    assert.notEqual(le(bound), undefined, `boundary ${bound} was dropped — §5.30's numbers stop comparing`);
+  }
+});

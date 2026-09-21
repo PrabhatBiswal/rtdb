@@ -31,6 +31,17 @@ class Mirror {
     val overlay = mutableListOf<OverlayOp>()
 
     /**
+     * §5.36: what serverState is HOLDING, tombstones included. The soak's bound on growth is a
+     * claim about these two numbers and not about the JVM heap — a heap reading on a laptop under
+     * memory pressure measures the GC, while a cell count that climbs with TIME rather than with
+     * the data is exactly the leak (§7 tombstones are retained until a covering write, and nothing
+     * else in here is unbounded).
+     */
+    internal val cellCount: Int get() = cells.size
+
+    internal val tombstoneCount: Int get() = cells.count { it.value.deleted }
+
+    /**
      * §3: the client replaces the sub's serverState with the snapshot value — but §7 (v1.3) applies
      * per-leaf LWW here too: a leaf or tombstone recorded ABOVE the snapshot's rev survives it. A
      * setup snapshot can legitimately read older than deltas this connection already applied

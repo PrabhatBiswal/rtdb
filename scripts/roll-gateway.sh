@@ -18,11 +18,21 @@ set -euo pipefail
 SHA=${1:?usage: roll-gateway.sh <sha> <gw-1|gw-2>}
 GW=${2:?usage: roll-gateway.sh <sha> <gw-1|gw-2>}
 
-# The instance map lives here rather than in a second file: two names, and a roll aimed at the wrong
-# box is the failure this script exists to make boring (§5.26's mentor arm hit the wrong tag).
+# The instance map used to be two literals right here — "two names, and a roll aimed at the wrong
+# box is the failure this script exists to make boring". The reasoning held; the placement did not.
+# These are THIS account's instance ids, this script is exported to a public repository, and they
+# went out in it. They live in the gitignored `deploy/site.env` now, beside the same `GW1`/`GW2`
+# that `deploy/fleet-wake.sh` already reads, and this script refuses to guess if they are unset —
+# an unset variable must not become a roll aimed at nothing.
+SITE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy" && pwd)/site.env"
+[ -r "$SITE" ] || { echo "missing $SITE — see deploy/site.env.example" >&2; exit 2; }
+# shellcheck disable=SC1090
+. "$SITE"
+: "${GW1:?set GW1 in deploy/site.env}"
+: "${GW2:?set GW2 in deploy/site.env}"
 case $GW in
-  gw-1) INST=i-027553b309c34c228 ;;
-  gw-2) INST=i-02ae35a597d9319e9 ;;
+  gw-1) INST=$GW1 ;;
+  gw-2) INST=$GW2 ;;
   *) echo "unknown gateway: $GW (gw-1|gw-2)" >&2; exit 2 ;;
 esac
 

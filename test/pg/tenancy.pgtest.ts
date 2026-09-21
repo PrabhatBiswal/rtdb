@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import test, { after } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import {
   DEFAULT_CONTROL_SCHEMA,
@@ -7,7 +10,7 @@ import {
   PostgresStorage,
   sharedPoolSize,
 } from '../../src/storage/postgres.ts';
-import { signDevToken } from '../../src/gateway/auth.ts';
+import { devSecret, signDevToken } from '../../src/gateway/auth.ts';
 import { startGateway } from '../../src/gateway/server.ts';
 import * as M from '../../src/gateway/metrics.ts';
 import { waitUntil, wsUrl } from '../helpers.ts';
@@ -230,4 +233,76 @@ test('the quota column is added to a registry that already exists, and NULL mean
   // Re-declaring must not reset it, on this storage as on the other (`ON CONFLICT DO NOTHING`).
   await shared.storage.declareDatabase('gamma', 'console-rw-someone-else');
   assert.deepEqual(await shared.storage.describeDatabase('gamma'), { quotaAcqPerSec: 120 });
+});
+
+/**
+ * §5.35 (2): `RTDB_PG_POOL` in multi-tenant mode — a knob that does nothing, said out loud.
+ *
+ * `main.ts` reads it in `storageFromEnv()`, which this mode never calls: the pool is sized from the
+ * registry by `sharedPoolSize`, and that is deliberate (a fixed number would hide the
+ * registry-derived size `rtdb_pg_pool_waiting` exists to make visible). Production sets BOTH in one
+ * file — `deploy/user-data/rtdb-deploy.sh` writes `RTDB_PG_POOL` and `RTDB_MULTI_TENANT=1` into
+ * `/opt/rtdb/gateway.env` — so the two candidate fixes both cost something real: refusing the pair
+ * bricks the next roll (that script is already on the boxes), and honouring it moves a live pool
+ * size. The boot line is the third answer, and this is the test of it.
+ *
+ * Out of process, against a real registry, because the claim is about what an operator READS after
+ * a deploy — and because it also proves the pair still BOOTS, which is the half a source-level
+ * assertion could never say.
+ */
+test('§5.35: the multi-tenant boot line names the registry size AND the ignored knob', async (t) => {
+  const declared = await shared.storage.listDeclared();
+  const expected = sharedPoolSize(declared.length + 1);
+  assert.notEqual(expected, 20, 'the knob and the registry must disagree or this proves nothing');
+
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx', 'src/gateway/main.ts'],
+    {
+      cwd: fileURLToPath(new URL('../../', import.meta.url)),
+      env: {
+        ...process.env,
+        RTDB_PORT: '0',
+        RTDB_STORAGE: 'postgres',
+        RTDB_PG_URL: db.url,
+        RTDB_MULTI_TENANT: '1',
+        // The whole point: set, and sized from nothing.
+        RTDB_PG_POOL: '20',
+        // main.ts refuses Postgres without these two (§5.19, §5.16), and neither is what is under
+        // test here — the harness names the same policy for the same reason.
+        RTDB_DEV_SECRET: devSecret(),
+        RTDB_RULES: 'harness/allow-all-rules.ts',
+        RTDB_REDIS_URL: '',
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    },
+  );
+  t.after(async () => {
+    child.kill('SIGKILL');
+    await once(child, 'exit');
+  });
+
+  let stderr = '';
+  const line = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no boot line in 20s; stderr was:\n${stderr}`)), 20_000);
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+      stderr += chunk;
+      const m = /^rtdb multi-tenant:.*$/m.exec(stderr);
+      if (m) {
+        clearTimeout(timer);
+        resolve(m[0]);
+      }
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`gateway exited (code ${code}) before saying anything; stderr:\n${stderr}`));
+    });
+  });
+
+  assert.match(
+    line,
+    new RegExp(`pool max ${expected} \\(RTDB_PG_POOL=20 ignored: size comes from the registry\\)`),
+    `the line must name both numbers, and it said: ${line}`,
+  );
 });

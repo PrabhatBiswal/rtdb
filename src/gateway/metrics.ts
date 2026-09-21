@@ -33,9 +33,18 @@ import { DEFAULT_LIMITS } from '../protocol/limits.ts';
  * 900 and 1800 are added rather than the scale rewritten: existing recording rules and dashboards
  * keep every boundary they already query, and 30 minutes is past any latency this system could
  * report and still be called working.
+ *
+ * §5.35 adds 600 and 1200 for RESOLUTION, not reach — the ceiling has been 1800 in THIS TREE since
+ * 1731986. Production is a different question: `5fa0069` (2026-09-09) predates that commit and
+ * still tops at 300, so until it is rolled, `histogram_quantile` over a pegged ack returns exactly
+ * 300 — the highest FINITE bound, which is what a quantile landing in +Inf reports. That is how
+ * §5.30's C2' read "p50 = p99 = 300 s"; read it as right-censored, true value >= 300 s. The hole was between 300 and 900: §5.30 measured CLIENT-side
+ * acks at 385-750 s, and every one of those reports as `le=900`, a quantile up to 1.8x the truth.
+ * Two boundaries, so +2 series per label set on both histograms.
  */
 const LATENCY_BUCKETS = [
-  0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10, 30, 60, 120, 300, 900, 1800,
+  0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10, 30, 60, 120, 300, 600, 900,
+  1200, 1800,
 ];
 
 export const connections = new Gauge({

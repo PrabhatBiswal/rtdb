@@ -51,8 +51,34 @@ dependencies {
 }
 
 tasks.test {
-    useJUnitPlatform()
+    // §5.36: the soak runs for twenty minutes by design, so it is not part of "the battery".
+    // Excluded by TAG rather than by class name, so a second soak needs no build change.
+    useJUnitPlatform { excludeTags("soak") }
     testLogging { events("failed") }
+}
+
+/**
+ * §5.36: `./gradlew soak` — the long-running SDK soak, and nothing else.
+ *
+ * Shape comes from system properties, so the same file is the smoke and the real run:
+ *   ./gradlew soak                                      # 50 clients, 20 minutes (the §5.36 order)
+ *   ./gradlew soak -Dsoak.clients=10 -Dsoak.minutes=2    # a ~2 minute smoke
+ * Known properties: soak.clients, soak.minutes, soak.writers, soak.rate, soak.keys,
+ * soak.killEverySec, soak.killCount, soak.observers.
+ */
+tasks.register<Test>("soak") {
+    description = "The §5.36 long-running SDK soak (@Tag(\"soak\")). Minutes, not seconds."
+    group = "verification"
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath
+    useJUnitPlatform { includeTags("soak") }
+    // The run IS the report: its own log lines are the numbers §5.22 quotes.
+    testLogging { events("failed", "passed"); showStandardStreams = true }
+    // Never UP-TO-DATE: a soak that is skipped because nothing changed has measured nothing.
+    outputs.upToDateWhen { false }
+    for ((key, value) in System.getProperties()) {
+        if (key is String && key.startsWith("soak.")) systemProperty(key, value.toString())
+    }
 }
 
 publishing {

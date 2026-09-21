@@ -6,9 +6,9 @@
 # THE INSTANCES ARE STARTED ONE AT A TIME, and that is not tidiness. A single
 # `start-instances --instance-ids A B C` is one call: `InsufficientInstanceCapacity` for ONE of them
 # fails the whole call, nothing starts, and the error does not say which instance or which AZ was
-# short. That happened on 2026-09-16 — `ap-south-1b` had no `t4g.medium` while gw-2 in `1c` and the
-# `t4g.small` ops box in `1b` would both have started fine. Per-instance, the shortage costs you the
-# one instance it actually applies to.
+# short. That happened on 2026-09-16 — ONE zone had no `t4g.medium` while the gateway in another
+# zone and the `t4g.small` ops box would both have started fine. Per-instance, the shortage costs
+# you the one instance it actually applies to.
 #
 # AND A MISSING GATEWAY IS NOT A BLOCKER: §8 sizes EACH gateway for 100% of the load, so one healthy
 # gateway is a serving fleet. What you lose is redundancy, not availability — which is worth knowing

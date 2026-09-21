@@ -23,6 +23,9 @@ class GatewayProcess private constructor(
 
     val url: String get() = "ws://127.0.0.1:$port"
 
+    /** §5.36: the OS pid, so a soak can read the gateway's RSS from outside the JVM. */
+    val pid: Long get() = process?.pid() ?: error("gateway is not running")
+
     companion object {
         /** rtdb/ — the repo root, two levels up from sdk-kotlin's working directory. */
         private val REPO = File(System.getProperty("user.dir")).parentFile

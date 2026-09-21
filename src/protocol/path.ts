@@ -77,7 +77,7 @@ export const RESERVED_NAME_PREFIX = '_';
  * stricter than a path segment. The rule lives HERE, with the name rule it belongs to, and
  * `postgres.ts` imports it — because the alternative is what this project already ran into.
  *
- * `LightingMacQueen` passed `validateDatabaseName` and was refused by the storage adapter's own
+ * `TenantAlpha` passed `validateDatabaseName` and was refused by the storage adapter's own
  * guard, so a client could DECLARE it, MINT a token for it, and only then have hello fail with
  * 1011 at the factory — leaving a registry row that **cannot be deleted**, because §5.19 gave
  * declaring no inverse on purpose. Two validators, one name, and the disagreement surfaced three

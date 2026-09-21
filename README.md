@@ -30,7 +30,10 @@ as of protocol v1.6:
 | `keepSynced()`, disk persistence | Absent. The mirror is memory-only; a cold start re-fetches. Offline *writes* do survive a disconnect — offline *reads* do not survive a process restart. |
 | One-shot `get()` | Absent — subscribe and take the first snapshot. §11 E1. |
 | REST API | None. WebSocket only, so no `curl`-able reads and no webhook-shaped integrations. |
-| Priorities, `onChildMoved`, `previousChildName` | Deliberately not implemented. |
+| Priorities, `onChildMoved`, `previousChildName` | Deliberately not implemented. Ordering arrives with §11 E2's windowed queries; until there is a server-side order, a "moved" event has nothing to be moved within. |
+| iOS / Swift SDK | Absent. Kotlin (plain JVM) and Android today; the protocol is public, so a third SDK is work, not a design question. |
+| Multi-region | Absent. One shard, one region. Nothing in the protocol forbids more; nothing implements it. |
+| Google's capacity | Today this runs on ONE gateway instance. That is a deployment fact rather than a design limit — §8 sizes each gateway for 100% of the shard so a second is a Terraform variable — but it is the honest shape of what has been measured. |
 
 `.info/connected` does work, and so do `updateChildren` across several keys, child events, and the
 offline write queue.
@@ -38,6 +41,110 @@ offline write queue.
 The rows carrying an E-number are designed in [`PROTOCOL.md`](PROTOCOL.md) §11 — design-ready,
 scheduled separately, not implemented. Design-ready is not a delivery date. Everything else in that
 table is absent by decision.
+
+### What works differently, and why
+
+Same call sites, different machinery underneath. A comparer should look here rather than at the API
+surface, because this is where behaviour actually diverges.
+
+- **Reconnect resumes from a revision, not from a re-listen.** A client stores the last rev it saw
+  per subscription and sends it with `listen`; the server replies with the deltas since that rev, or
+  a fresh snapshot if it cannot serve them ([`PROTOCOL.md`](PROTOCOL.md) §3, §6). Firebase re-syncs
+  by comparing hashes and re-sending what differs. *Measured on three handsets against a live
+  deployment: one phone offline through three writes it never saw, radio flapping on the way back
+  up — the reconnect was served as two catch-ups and zero snapshots, and all three missed children
+  arrived exactly once, in key order. Witness: the gateway's own `listens{result}` counters
+  (`catchup` +2, `snapshot` +0) plus the phone's glass.*
+- **Ordering is a property of the write path, not of the client.** Every write for a shard passes
+  one dispatcher and one Redis stream, so frames leave in commit order and a client never
+  gap-detects or reorders ([`PROTOCOL.md`](PROTOCOL.md) §8). Gaps in a subscription's rev sequence
+  are normal and are not an error.
+- **The client mirror defends itself with per-leaf revisions and tombstones.** Every leaf carries the
+  rev that wrote it; a delta older than the leaf it touches is dropped, and a delete leaves a
+  rev-stamped tombstone so a late frame cannot resurrect it ([`PROTOCOL.md`](PROTOCOL.md) §7). It is
+  defence in depth — the dispatcher above already guarantees order. *Measured over a 20-minute soak:
+  574,000 child events, 111 forced reconnects, zero duplicate states delivered to a reading client
+  and zero removes for a child never added.*
+- **Quotas are per database, and the console says where the number came from.** Each database has an
+  acquisition-rate budget, and the UI distinguishes a shard default from an explicit override
+  instead of showing one blended figure — which matters, because the two fail differently.
+  *Measured: see the quota row under [Measured](#measured) — a database can refuse writes while its
+  average rate sits at a third of its limit.*
+- **The usage meters are bill-shaped, and they publish their own caveats.** Connections include
+  console sessions; storage is a high-water mark, not an average; downloads are counted before TLS
+  framing; load is utilisation (ρ), not a queue depth. Firebase's equivalents are averaged and their
+  definitions are not stated. A meter you cannot reconcile with an invoice is decoration.
+- **Cost is a line you can read rather than a bill that arrives.** The deployment this was measured
+  on ran at **$5.09/day**, identical to the cent every day across a seven-day window
+  (2026-09-03 → 09-09, read from the billing API on 09-10) — about **$153/month**, against a
+  pre-build estimate of $181/month. For scale, **this project's own** Firebase bill — the one it
+  exists to replace, not a customer's — ran at **~$1,700/month**, essentially all of it downloads:
+  **1.69 TB/month against 438 MB of stored data**, so every stored byte left the database roughly
+  3,800 times a month. Read off the provider's own usage console for the **August 2026 billing
+  period (read 2026-08-31)**; it is the number in this project's mission statement, and it is what
+  "fat listen shapes" costs when you pay per byte delivered.
+
+### What works the same
+
+Stated plainly, because a migration guide that only lists differences is not honest about the ones
+that matter:
+
+- **One changed child sends one delta frame.** Not a re-snapshot of the subtree — the thing most
+  people actually mean by "realtime database". *Measured phone-to-phone on a live deployment: a
+  single new child produced three delta frames to three subscribers and zero snapshots, in both
+  directions.*
+- **`child_added` / `child_changed` / `child_removed`,** with a late listener replayed the existing
+  children exactly as Firebase does.
+- **Optimistic local write.** Your write shows on your own client immediately and settles later,
+  including the consequence Firebase also has and rarely documents: on a key two clients are writing
+  at once, the writer sees its own value, then the other client's, then its own again. *Measured at
+  4.1% of writes issued, on writer clients only; clients that only read saw none of it.* Rendering a
+  list straight from a child-event stream on a contended key will flicker, here and there alike.
+
+---
+
+## Measured
+
+**2026-09-21, one `m7g.medium` gateway (1 vCPU, no burst credits) against `db.t4g.medium` Postgres,
+one region, one shard.** Every number below carries its shape and its witness. Where a measurement
+came from a laptop rather than that deployment, the heading says so — the two are not comparable and
+mixing them would be the easiest lie in this file.
+
+### On the deployed gateway
+
+| what | shape | number | witness |
+|---|---|---|---|
+| **Load scales linearly THROUGH 800 w/s** — a waypoint, not a limit; see the two rows below | 1,000 → 2,000 → 3,000 connections, 200 → 400 → 800 writes/s offered, `hot 0`, 150 s per step, two databases | Commit rate equalled offered rate at every step, **zero write errors**. Gateway CPU **0.145 → 0.280 → 0.373 cores**; connections 1,006 → 2,007 → 3,008; pool waiters 0 throughout | Two client tails per step, plus a server-side window anchored at the step (not at read time) |
+| **The tail grows faster than the load** | as above | Client ack p99 **91 ms → 527 ms → 12 s** while p50 stayed at **19 → 20 → 28 ms** | Same. The 12 s is a step-start transient — 3,000 connections subscribing at once while the first writes land — not steady-state saturation; the p50 is the steady state |
+| **A quota clips burst shape, not average rate** | 509 connections on one database, ~100 writes/s, `hot 0.1`, ~3 min | **413 writes refused** for rate while the measured average acquisition rate was **23.4/s against a limit of 64/s** | Client tails (413 counted) and an anchored server window (≈444 by extrapolation) |
+| **The write path did not reach a ceiling** | 11,006 → 17,006 connections, `hot 0`, two databases, writes offered as fast as the rig could push | **4,010 writes/s at 0.30–0.34 of a core.** Lock acquisitions ~10/s — group commit folding ~400 writes into one — event-loop lag 1.4 ms, pool waiters 0 | Live reads through the ops Prometheus at two points in the rung. **The RIG pegged first: a load client sat at 99% CPU.** So 4,010 w/s is a floor under the gateway's write path, not its ceiling |
+| **Cross-database isolation held all the way up** | 1,000 → 17,000 connections and the full write load on two databases; three handsets subscribed to a third | Phone-to-phone arrival **2–5 s at every rung from 1,000 to 17,000 connections** — it did not degrade as the rig climbed, it did not move. The worst arrival of the night, **7 s**, was the one rung whose load was on the phones' OWN database | Three handsets, ±2 s render poll. Two rungs (2,000 and 3,000 connections) have **no trustworthy arrival number and are recorded as holes** — the harness watched a pane that new children scrolled out of — not as failures |
+| **The break, when it came, was MEMORY** | ~17,000 connections being torn DOWN | `JavaScript heap out of memory` at **~1.9 GB**, V8's default cap on a 4 GiB box, with **no heap flag set anywhere**. Measured cost: **0.103 MB of heap per connection** over 91 samples — 1,006 connections = 33 MB, 17,006 = 1,860 MB, and the cap is 1,900 | Gateway logs and a regression over the ramp's own samples. **It died during TEARDOWN, about nine seconds after the rig's connections reached zero — not while serving them**, which is a different claim and the weaker one |
+| **Recovery was unaided, and bounded by the restart** | the above | Container back in **~5 minutes**; the three handsets reconnected **by themselves 8–29 s after it returned**, having spent the outage in correct widening backoff. **Trees intact** — nothing lost across an OOM kill. The rig's own 7,800 abandoned clients came back as **4,261 catch-ups to 2,972 snapshots** | Each phone's own log, and the gateway's counters for the reconnect storm |
+| **Cross-database isolation, at the glass** | 1,000 connections and ~200 writes/s on two databases; three Android handsets subscribed to a third | Arrival on a second phone **~2 s — indistinguishable from the same test with no load at all**, no client dropped to `WAITING` | Three real handsets, arrival read off rendered pixels on a fixed 2 s poll, so **±2 s** and "~2 s" means *at or below the poll floor* |
+| **Reconnect catch-up across a radio flap** | one handset offline through three writes, its radio flapping on the way back | **catch-up ×2, snapshot ×0**; all three children arrived exactly once, in order | Gateway `listens{result}` counters and the phone's screen |
+| **One-child delta, both directions** | two handsets, one new child each way | **+3 delta frames to three subscribers, +0 snapshots** | Gateway counters, plus both screens rendering byte-identical values |
+| **Backgrounding is the handset's decision, not the protocol's** | three handsets, three vendors, app backgrounded ~65 s | **Two of three dropped** the socket 8–10 s after backgrounding; one never dropped. Recovery on return: **~5 s** and **~15 s**, clean, no duplicate events | The decisive one: on both handsets that dropped, *the app's own 5 s log line stopped at the same instant the socket died* — the process was frozen by vendor power management, which is not a protocol event. Going to the background never touches the socket in SDK code |
+
+**What these do not show.** **No WRITE ceiling was found** — the rig ran out of CPU before the
+gateway did, so 4,010 w/s is a number this hardware beat, not a number it could not pass. **The
+fanout ceiling was not measured at all:** the run that was meant to find it put its fan-out load on
+clients that were already saturated, so the delivery rate it produced measures the receivers, not
+the server. An earlier figure of 575 w/s per gateway, if you have seen it, was a DELIVERY ceiling at
+a different write shape and was never a write ceiling. Server-side ack p99 on this build tops out at
+300 s and reports exactly that when it saturates, so a pegged figure means *at least* 300 s. The
+handset results cover three devices from three vendors and say nothing about a fourth. And the
+memory ceiling above is one measurement of one break: 0.103 MB per connection is this workload's
+number — subscriptions, tree shape and payload size all move it.
+
+### On a laptop, not on that gateway
+
+| what | shape | number |
+|---|---|---|
+| **20-minute SDK soak** | 50 clients in one JVM, each with a value listener and a child-event stream; 5 of them writing; **three sockets killed from outside every 30 s**; in-memory storage | **11,477 writes, 111 forced reconnects.** Every one of the 50 client mirrors equalled the server at all ten checkpoints and at the end. **Zero** duplicate child states on reading clients, **zero** removes-without-add across 574,000 child events. Client mirror bounded by the data, not by the run — tombstones flat from minute 2 to minute 20 |
+
+Run it yourself: `cd sdk-kotlin && ./gradlew soak`. It is excluded from the normal battery because it
+takes twenty minutes.
 
 ---
 
@@ -451,6 +558,8 @@ applied change — whether that change came from the server or from this client'
 write. They always read the local mirror, never a network round trip.
 
 Child events (`addChildEventListener`) and a coroutines `Flow` (`ref.values()`) are both available.
+Child events have a Flow too — `ref.childEvents(): Flow<ChildEvent>`. It is not conflated: a value
+stream can skip to the latest, a child stream is a sequence and a dropped event never comes back.
 
 ### Contended values
 
@@ -468,10 +577,20 @@ npm run check        # typecheck + the unit and integration battery
 npm run test:pg      # against a real Postgres
 npm run test:bus     # multi-gateway fanout, needs Redis
 npm run chaos        # SIGKILL a gateway mid-traffic and assert nothing is lost
+
+cd sdk-kotlin && ./gradlew soak   # 50 SDK clients, 20 minutes, sockets cut every 30s (§5.36)
 ```
 
 The chaos suite is the interesting one: it kills gateways during live traffic and asserts that
 clients back off, reconnect, replay their pending writes, and converge on the same tree.
+
+The soak is the slow one, and it is deliberately NOT part of `./gradlew test`: 50 Kotlin clients
+with value and `childEvents()` listeners, five of them writing, three sockets killed from outside
+every thirty seconds, for twenty minutes. It asserts what only time can break — every mirror still
+equals the server, no child state delivered twice to a reading client, and a mirror bounded by the
+data rather than by the run — and reports reconnects, heap, gateway RSS and cross-client latency.
+Its shape is all system properties, so `./gradlew soak -Dsoak.clients=10 -Dsoak.minutes=2` is a
+smoke; `SoakTest.kt` lists the rest.
 
 ---
 

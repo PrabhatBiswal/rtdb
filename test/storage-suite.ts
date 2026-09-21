@@ -122,7 +122,7 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
 
   test(`${name}: a database name is a SCHEMA name, and the registry refuses what storage would (§5.26)`, async () => {
     /**
-     * These two rules used to live apart: `validateDatabaseName` accepted `LightingMacQueen` and
+     * These two rules used to live apart: `validateDatabaseName` accepted `TenantAlpha` and
      * `PostgresStorage`'s constructor refused it. So a client could declare that name, mint a token
      * for it, and only then have hello fail — 1011 at the factory, three steps from the cause, with
      * a registry row that CANNOT be deleted because §5.19 gave declaring no inverse.
@@ -135,7 +135,7 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
     // Postgres folds an unquoted identifier to lowercase, so `Car` would create `car` and the
     // registry would disagree with the catalogue about the name forever.
     await assert.rejects(() => s.declareDatabase('Car_Race', 'console-rw-owner'), /lowercase/, 'capitals');
-    await assert.rejects(() => s.declareDatabase('LightingMacQueen', 'console-rw-owner'), /lowercase/, 'the real one');
+    await assert.rejects(() => s.declareDatabase('TenantAlpha', 'console-rw-owner'), /lowercase/, 'the real one');
     // A hyphen is not an identifier character: it would have to be quoted at every interpolation.
     await assert.rejects(() => s.declareDatabase('car-race', 'console-rw-owner'), /lowercase/, 'hyphen');
     await assert.rejects(() => s.declareDatabase('9lives', 'console-rw-owner'), /digit/, 'leading digit');
@@ -144,10 +144,10 @@ export function storageSemantics(name: string, make: (limits: Limits) => Storage
 
     // And the shape that is legal stays legal — the rule refuses characters, not names.
     await s.declareDatabase('car_race', 'console-rw-owner');
-    await s.declareDatabase('lightingmacqueen', 'console-rw-owner');
+    await s.declareDatabase('tenantalpha', 'console-rw-owner');
     const declared = await s.listDeclared();
-    for (const ok of ['car_race', 'lightingmacqueen']) assert.ok(declared.includes(ok), ok);
-    for (const bad of ['Car_Race', 'LightingMacQueen', 'car-race', '9lives', long]) {
+    for (const ok of ['car_race', 'tenantalpha']) assert.ok(declared.includes(ok), ok);
+    for (const bad of ['Car_Race', 'TenantAlpha', 'car-race', '9lives', long]) {
       assert.ok(!declared.includes(bad), `${bad} never reached the registry`);
     }
   });

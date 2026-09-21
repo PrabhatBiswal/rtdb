@@ -1,5 +1,6 @@
 package com.hobostays.rtdb
 
+import com.hobostays.rtdb.api.ChildEvent
 import com.hobostays.rtdb.api.ChildEventListener
 import com.hobostays.rtdb.api.RtdbClient
 import com.hobostays.rtdb.api.DataSnapshot
@@ -309,4 +310,11 @@ class SpyTransports(private val delegate: TransportFactory = OkHttpTransportFact
             else -> listOf(frame)
         }
     }.filter { it["type"]?.jsonPrimitive?.content == type }
+}
+
+/** A [ChildEvent] in [ChildRecorder]'s "added:key=value" form, so the Flow tests read like the callback ones. */
+fun ChildEvent.label(): String = when (this) {
+    is ChildEvent.Added -> "added:${snapshot.key}=${snapshot.value}"
+    is ChildEvent.Changed -> "changed:${snapshot.key}=${snapshot.value}"
+    is ChildEvent.Removed -> "removed:${snapshot.key}=${snapshot.value}"
 }

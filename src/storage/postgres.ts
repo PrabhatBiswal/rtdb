@@ -617,6 +617,19 @@ export class PostgresStorage implements StorageAdapter {
     this.#unhookPool = forgetPidsOnRemove(this.#pool, (pid) => this.#ownPids.delete(pid));
   }
 
+  /**
+   * §5.35: waiters on THIS adapter's pool, for `bindPoolWaiting`.
+   *
+   * The gauge existed since Gate D and only the multi-tenant path ever bound it, because there the
+   * pool is built outside the adapter and `main.ts` holds it. On the single-tenant path the adapter
+   * owns its pool and nothing else can see it, so `rtdb_pg_pool_waiting` read 0 whatever the pool
+   * did — on the shape that is today's entire production. One getter rather than exposing `#pool`:
+   * the metric needs one number, and a borrowed pool's owner still reads the same one.
+   */
+  get poolWaiting(): number {
+    return this.#pool.waitingCount;
+  }
+
   head(): Promise<number> {
     return this.#counter('v');
   }
